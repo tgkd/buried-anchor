@@ -45,6 +45,7 @@ and must be launched through `open`:
 make run                                                    # or make prod
 open -a "$PWD/.build/BuriedAnchor.app" --args --selftest afplay 150 [--switch]
 open -a "$PWD/.build/BuriedAnchor.app" --args --multi tonePlayerA 50 tonePlayerB 150
+open -a "$PWD/.build/BuriedAnchor.app" --args --suspend afplay
 open -a "$PWD/.build/BuriedAnchor.app" --args --watch 30
 open -a "$PWD/.build/BuriedAnchor.app" --args --loginitem
 ```
@@ -88,6 +89,15 @@ Two cost tiers, and the difference matters:
 
 An app is untapped and bit-transparent until its slider first leaves 100%, then keeps its tap for
 the session. `MixRenderer.maxSlots` (32) caps controlled apps.
+
+**Suspension** is the third tier. When every controlled app sits at exactly 100%, `MixerModel`
+counts 15 ticks (1.5 s) and calls `engine.suspend()`, which tears down the IOProc but keeps the taps
+and the aggregate. `.mutedWhenTapped` only mutes while a running IOProc consumes the tap, so this
+hands every app back its own bit-transparent output and makes macOS drop the purple system-audio
+indicator — verified with `--suspend`. Resume is `startIO()` on the surviving aggregate, so slot
+mapping and gains are untouched; any gain leaving 1.0 resumes immediately, before the next tick.
+This is why percentages are rounded in `setPercent` and on load: a slider left at 100.19% reads as
+"100%" but is not `gain == 1`, so it would hold a tap and keep the indicator lit forever.
 
 `MixerModel.reset(_:)` is the *only* caller of `engine.release`, so it is the only path back out of
 the graph and the only way to free a slot. It is reached from the row's right-click menu — not from

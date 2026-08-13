@@ -30,6 +30,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             SelfTest.runWatch(model: model)
             return
         }
+        if CommandLine.arguments.contains("--suspend") {
+            SelfTest.runSuspend(model: model)
+            return
+        }
         if CommandLine.arguments.contains("--multi") {
             SelfTest.runMulti(model: model)
             return
@@ -223,6 +227,10 @@ struct AppRow: View {
 
             Slider(value: percentBinding, in: 0...150)
                 .frame(height: rowHeight)
+                .simultaneousGesture(
+                    TapGesture(count: 2).onEnded { model.setPercent(100, for: row.id) }
+                )
+                .help("Double-click to snap back to 100%")
 
             Text("\(Int(row.percent))%")
                 .font(.caption.monospacedDigit())

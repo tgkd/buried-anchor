@@ -10,7 +10,56 @@ enum SelfTest {
         CommandLine.arguments.contains("--selftest")
             || CommandLine.arguments.contains("--multi")
             || CommandLine.arguments.contains("--watch")
+            || CommandLine.arguments.contains("--suspend")
             || CommandLine.arguments.contains("--loginitem")
+    }
+
+    static func runSuspend(model: MixerModel) {
+        let arguments = CommandLine.arguments
+        guard let index = arguments.firstIndex(of: "--suspend") else { return }
+        let match = index + 1 < arguments.count ? arguments[index + 1] : ""
+
+        note("=== suspend match=\(match) ===")
+        model.start()
+        note("permission=\(model.permission) output=\(model.outputDeviceName)")
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(800))
+            guard let target = model.rows.filter(\.isPlaying).first(where: {
+                match.isEmpty
+                    || $0.id.localizedCaseInsensitiveContains(match)
+                    || $0.name.localizedCaseInsensitiveContains(match)
+            }) else {
+                note("FAIL no playing row matching '\(match)'")
+                model.shutdown()
+                NSApp.terminate(nil)
+                return
+            }
+            note("target=\(target.id)")
+
+            model.setPercent(50, for: target.id)
+            let a = await measure(model, id: target.id, seconds: 3, settle: 1.2)
+            note("A 50%: peak=\(fmt(a)) controlled=\(isControlled(model, target.id))")
+
+            model.setPercent(100, for: target.id)
+            let b = await measure(model, id: target.id, seconds: 3, settle: 2.5)
+            note("B 100%: peak=\(fmt(b)) controlled=\(isControlled(model, target.id))")
+
+            model.setPercent(50, for: target.id)
+            let c = await measure(model, id: target.id, seconds: 3, settle: 1.2)
+            note("C 50% again: peak=\(fmt(c)) controlled=\(isControlled(model, target.id))")
+
+            note(b < a * 0.2 ? "PASS suspended at 100%" : "FAIL still rendering at 100%: \(fmt(b))")
+            note(c > a * 0.7 ? "PASS resumed at 50%" : "FAIL did not resume: A=\(fmt(a)) C=\(fmt(c))")
+            note(isControlled(model, target.id) ? "PASS tap kept across the cycle" : "FAIL tap was released")
+            note("done")
+            model.shutdown()
+            NSApp.terminate(nil)
+        }
+    }
+
+    private static func isControlled(_ model: MixerModel, _ id: String) -> Bool {
+        model.rows.first { $0.id == id }?.isControlled ?? false
     }
 
     static func runLoginItem() {
@@ -52,7 +101,7 @@ enum SelfTest {
             while Date().timeIntervalSince(started) < seconds {
                 let elapsed = Int(Date().timeIntervalSince(started))
                 let listing = model.rows
-                    .map { "\($0.name)\($0.isPlaying ? "*" : "")" }
+                    .map { "\($0.name)\($0.isPlaying ? "*" : "")@\(Int($0.percent))\($0.isControlled ? "!" : "")" }
                     .joined(separator: ", ")
                 note("t=\(elapsed)s rows=[\(listing)]")
                 try? await Task.sleep(for: .seconds(3))

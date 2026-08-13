@@ -40,6 +40,8 @@ final class MixerModel {
     private var timer: Timer?
     private var processListListener: PropertyListener?
     private var tick = 0
+    private var unityTicks = 0
+    private let suspendAfterTicks = 15
     private var started = false
     private struct LingerEntry {
         let name: String
@@ -54,8 +56,10 @@ final class MixerModel {
     private let softClipKey = "softClip"
 
     init() {
-        percents = (UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: Double]) ?? [:]
-        premute = (UserDefaults.standard.dictionary(forKey: premuteKey) as? [String: Double]) ?? [:]
+        percents = ((UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: Double]) ?? [:])
+            .mapValues { $0.rounded() }
+        premute = ((UserDefaults.standard.dictionary(forKey: premuteKey) as? [String: Double]) ?? [:])
+            .mapValues { $0.rounded() }
         softClip = UserDefaults.standard.bool(forKey: softClipKey)
         launchAtLogin = LoginItem.isEnabled
     }
@@ -87,7 +91,7 @@ final class MixerModel {
     }
 
     func setPercent(_ value: Double, for id: String) {
-        let clamped = min(max(value, 0), 150)
+        let clamped = min(max(value, 0), 150).rounded()
         percents[id] = clamped
         UserDefaults.standard.set(percents, forKey: defaultsKey)
         guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
@@ -98,6 +102,24 @@ final class MixerModel {
         applyGain(clamped, for: id, objectIDs: rows[index].objectIDs)
         rows[index].isControlled = engine.isControlled(id)
         engineError = engine.lastError
+        unityTicks = 0
+        updateSuspension()
+    }
+
+    private func updateSuspension() {
+        let keys = engine.controlledKeys
+        guard !keys.isEmpty else {
+            unityTicks = 0
+            return
+        }
+        guard keys.allSatisfy({ engine.gain(for: $0) == 1 }) else {
+            unityTicks = 0
+            engine.resume()
+            return
+        }
+        guard unityTicks < suspendAfterTicks else { return }
+        unityTicks += 1
+        if unityTicks == suspendAfterTicks { engine.suspend() }
     }
 
     private func applyGain(_ percent: Double, for id: String, objectIDs: [AudioObjectID]) {
@@ -166,6 +188,7 @@ final class MixerModel {
             registry.forgetTerminated()
         }
         refreshMeters()
+        updateSuspension()
     }
 
     private func refreshList() {

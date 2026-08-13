@@ -19,6 +19,7 @@ final class TapEngine {
     private var gains: [String: Float] = [:]
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
+    private var isSuspended = false
     private let ioQueue = DispatchQueue(label: "com.buriedanchor.ioproc", qos: .userInteractive)
     private var defaultDeviceListener: PropertyListener?
 
@@ -77,6 +78,23 @@ final class TapEngine {
         rebuild()
     }
 
+    func suspend() {
+        guard ioProcID != nil else { return }
+        teardownIO()
+        isSuspended = true
+        log.debug("suspended: IOProc torn down, \(self.order.count) taps kept")
+    }
+
+    func resume() {
+        guard isSuspended else { return }
+        isSuspended = false
+        guard aggregateID != AudioObjectID(kAudioObjectUnknown) else {
+            rebuild()
+            return
+        }
+        startIO()
+    }
+
     func syncObjectIDs(_ objectIDs: [AudioObjectID], for key: String) {
         guard var tap = taps[key], !objectIDs.isEmpty, tap.objectIDs != objectIDs else { return }
         let description = makeDescription(uuid: tap.uuid, objectIDs: objectIDs, key: key)
@@ -123,6 +141,7 @@ final class TapEngine {
     }
 
     private func rebuild() {
+        isSuspended = false
         teardownIO()
         destroyAggregate()
         guard !order.isEmpty else {

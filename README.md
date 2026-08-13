@@ -57,6 +57,10 @@ current default output device, with one `AudioDeviceIOProcID` on it.
   into the output — gain and summing in one pass, with a 30 ms ramp so slider moves don't zipper.
 - An app gets a tap the first time its slider leaves 100%, and keeps it for the session. Apps you
   never touch stay entirely outside the graph and are bit-transparent.
+- Once every controlled app is back at exactly 100%, the engine suspends itself after 1.5 s: the
+  IOProc is torn down while the taps and the aggregate stay alive. Each app returns to its own
+  bit-transparent output, and macOS drops the purple system-audio indicator. Any slider leaving
+  100% resumes it immediately, which costs one `AudioDeviceStart` rather than a rebuild.
 
 Above 100% the output can exceed full scale. Default is a hard clip at ±1.0 with a clip indicator;
 Settings › Soft clip switches to `tanhf` saturation above a 0.7 knee.
@@ -68,7 +72,9 @@ again; the remembered level survives a quit. Right-click a row to reset it to 10
 different operation from dragging the slider back, because it also destroys the app's tap and takes
 it out of the render graph entirely, returning it to bit-transparency and freeing one of the 32 tap
 slots. Dragging to 100% deliberately keeps the tap, since releasing it there would rebuild the
-shared aggregate every time the slider passed through 100 and interrupt every other controlled app.
+shared aggregate every time the slider passed through 100 and interrupt every other controlled app;
+the engine suspends instead, which reaches the same silence and the same dropped indicator without
+touching the aggregate. Double-click a slider to snap it back to exactly 100%.
 
 Settings (⌘, or the gear in the panel) holds "Launch at login", registered through
 `SMAppService.mainApp`, and the soft-clip toggle, which persists across launches.
@@ -89,10 +95,14 @@ Measured on macOS 27.0 (arm64) against a generated 0.20-amplitude tone:
 | Default output change mid-playback | rebuilt on new device, peak held, no error |
 | Helper grouping | Slack's 2 process objects collapse to one "Slack" row |
 | Processes with no bundle ID | fall back to executable name (`exec:afplay`) |
+| Suspend at 100% | 50% → `0.1250`, 100% → `0.0049` (no render), 50% again → `0.1251`, tap kept |
+| Fractional slider values | `100.19` saved → rounds to `100` on load → no tap created |
 
 `--selftest <match> <percent> [--switch]` and `--multi <matchA> <pctA> <matchB> <pctB>` run these
-headlessly and write `/tmp/buriedanchor-selftest.log`. `--loginitem` round-trips the login-item
-registration and reports `SMAppService` status at each step. All must be launched via `open -a`.
+headlessly and write `/tmp/buriedanchor-selftest.log`. `--suspend <match>` cycles one app
+50% → 100% → 50% and checks that the middle step stops rendering while keeping the tap.
+`--loginitem` round-trips the login-item registration and reports `SMAppService` status at each
+step. All must be launched via `open -a`.
 
 The multi-app test needs two distinct process names. Two instances of one binary collapse into a
 single row by design, so make renamed copies and ad-hoc sign them (copying breaks the original
