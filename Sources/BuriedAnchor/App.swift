@@ -70,7 +70,7 @@ struct MixerPanel: View {
                     .padding(.vertical, 16)
             } else {
                 ScrollView {
-                    VStack(spacing: 6) {
+                    VStack(spacing: 2) {
                         ForEach(model.rows) { row in
                             AppRow(row: row, model: model)
                         }
@@ -143,17 +143,36 @@ struct MixerPanel: View {
     }
 
     private var footer: some View {
-        HStack {
+        HStack(spacing: 8) {
             SettingsLink {
-                Label("Settings", systemImage: "gearshape")
+                FooterIcon(systemName: "gearshape")
             }
             .buttonStyle(.borderless)
-            .font(.caption)
+            .help("Settings")
             .simultaneousGesture(TapGesture().onEnded { NSApp.activate() })
+
             Spacer()
-            Button("Quit") { NSApp.terminate(nil) }
-                .font(.caption)
+
+            Button {
+                NSApp.terminate(nil)
+            } label: {
+                FooterIcon(systemName: "power")
+            }
+            .buttonStyle(.borderless)
+            .help("Quit Buried Anchor")
         }
+    }
+}
+
+struct FooterIcon: View {
+    let systemName: String
+
+    var body: some View {
+        Image(systemName: systemName)
+            .font(.system(size: 15, weight: .regular))
+            .foregroundStyle(.secondary)
+            .frame(width: 26, height: 26)
+            .contentShape(Rectangle())
     }
 }
 
@@ -170,10 +189,13 @@ struct AppRow: View {
 
     private var isMuted: Bool { row.percent == 0 }
 
+    private let iconSize: CGFloat = 20
+    private let rowHeight: CGFloat = 28
+
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(alignment: .center, spacing: 8) {
             icon
-            HStack(spacing: 6) {
+            HStack(alignment: .center, spacing: 6) {
                 Text(row.name)
                     .font(.callout)
                     .lineLimit(1)
@@ -185,13 +207,14 @@ struct AppRow: View {
                 )
                 Spacer(minLength: 0)
             }
-            .frame(width: 130, alignment: .leading)
+            .frame(width: 130, height: rowHeight, alignment: .leading)
 
             Button {
                 model.toggleMute(row.id)
             } label: {
                 Image(systemName: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                    .frame(width: 14)
+                    .frame(width: 16, height: rowHeight)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
             .font(.caption)
@@ -199,12 +222,15 @@ struct AppRow: View {
             .help(isMuted ? "Unmute" : "Mute")
 
             Slider(value: percentBinding, in: 0...150)
+                .frame(height: rowHeight)
 
             Text("\(Int(row.percent))%")
                 .font(.caption.monospacedDigit())
-                .frame(width: 38, alignment: .trailing)
+                .frame(width: 38, height: rowHeight, alignment: .trailing)
                 .foregroundStyle(row.percent > 100 ? .orange : .primary)
         }
+        .frame(height: rowHeight)
+        .contentShape(Rectangle())
         .contextMenu {
             Button(isMuted ? "Unmute" : "Mute") { model.toggleMute(row.id) }
             Divider()
@@ -221,7 +247,8 @@ struct AppRow: View {
                 Image(systemName: "app.dashed").resizable().foregroundStyle(.secondary)
             }
         }
-        .frame(width: 20, height: 20)
+        .frame(width: iconSize, height: iconSize)
+        .frame(height: rowHeight)
     }
 }
 
