@@ -56,7 +56,7 @@ final class TapEngine {
             guard gain != 1 else { return }
             guard !objectIDs.isEmpty else { return }
             guard taps.count < MixRenderer.maxSlots else {
-                lastError = "at the \(MixRenderer.maxSlots)-app limit; reset an app to free a slot"
+                lastError = "at the \(MixRenderer.maxSlots)-app limit; right-click an app and reset it to free a slot"
                 log.error("tap limit reached, refusing \(key, privacy: .public)")
                 return
             }

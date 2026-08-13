@@ -10,6 +10,10 @@ struct BuriedAnchorApp: App {
             MixerPanel(model: delegate.model)
         }
         .menuBarExtraStyle(.window)
+
+        Settings {
+            SettingsView(model: delegate.model)
+        }
     }
 }
 
@@ -18,6 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = MixerModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--loginitem") {
+            SelfTest.runLoginItem()
+            return
+        }
         if CommandLine.arguments.contains("--watch") {
             SelfTest.runWatch(model: model)
             return
@@ -39,7 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 struct MixerPanel: View {
-    @Bindable var model: MixerModel
+    let model: MixerModel
     @State private var rowsHeight: CGFloat = 0
 
     var body: some View {
@@ -136,9 +144,12 @@ struct MixerPanel: View {
 
     private var footer: some View {
         HStack {
-            Toggle("Soft clip", isOn: $model.softClip)
-                .toggleStyle(.checkbox)
-                .font(.caption)
+            SettingsLink {
+                Label("Settings", systemImage: "gearshape")
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+            .simultaneousGesture(TapGesture().onEnded { NSApp.activate() })
             Spacer()
             Button("Quit") { NSApp.terminate(nil) }
                 .font(.caption)
@@ -157,6 +168,8 @@ struct AppRow: View {
         )
     }
 
+    private var isMuted: Bool { row.percent == 0 }
+
     var body: some View {
         HStack(spacing: 8) {
             icon
@@ -174,22 +187,29 @@ struct AppRow: View {
             }
             .frame(width: 130, alignment: .leading)
 
+            Button {
+                model.toggleMute(row.id)
+            } label: {
+                Image(systemName: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .frame(width: 14)
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+            .foregroundStyle(isMuted ? Color.orange : Color.secondary)
+            .help(isMuted ? "Unmute" : "Mute")
+
             Slider(value: percentBinding, in: 0...150)
 
             Text("\(Int(row.percent))%")
                 .font(.caption.monospacedDigit())
                 .frame(width: 38, alignment: .trailing)
                 .foregroundStyle(row.percent > 100 ? .orange : .primary)
-
-            Button {
-                model.reset(row.id)
-            } label: {
-                Image(systemName: "arrow.uturn.backward")
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-            .opacity(row.isControlled ? 1 : 0.25)
-            .disabled(!row.isControlled)
+        }
+        .contextMenu {
+            Button(isMuted ? "Unmute" : "Mute") { model.toggleMute(row.id) }
+            Divider()
+            Button("Reset to 100% and stop controlling") { model.reset(row.id) }
+                .disabled(!row.isControlled)
         }
     }
 

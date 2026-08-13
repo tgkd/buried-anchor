@@ -59,7 +59,19 @@ current default output device, with one `AudioDeviceIOProcID` on it.
   never touch stay entirely outside the graph and are bit-transparent.
 
 Above 100% the output can exceed full scale. Default is a hard clip at ±1.0 with a clip indicator;
-the "Soft clip" toggle switches to `vvtanhf` saturation.
+Settings › Soft clip switches to `tanhf` saturation above a 0.7 knee.
+
+## The panel
+
+Each row has a mute button that drops the app to 0% and restores the previous level when pressed
+again; the remembered level survives a quit. Right-click a row to reset it to 100% — that is a
+different operation from dragging the slider back, because it also destroys the app's tap and takes
+it out of the render graph entirely, returning it to bit-transparency and freeing one of the 32 tap
+slots. Dragging to 100% deliberately keeps the tap, since releasing it there would rebuild the
+shared aggregate every time the slider passed through 100 and interrupt every other controlled app.
+
+Settings (⌘, or the gear in the panel) holds "Launch at login", registered through
+`SMAppService.mainApp`, and the soft-clip toggle, which persists across launches.
 
 ## Verified behavior
 
@@ -79,7 +91,8 @@ Measured on macOS 27.0 (arm64) against a generated 0.20-amplitude tone:
 | Processes with no bundle ID | fall back to executable name (`exec:afplay`) |
 
 `--selftest <match> <percent> [--switch]` and `--multi <matchA> <pctA> <matchB> <pctB>` run these
-headlessly and write `/tmp/buriedanchor-selftest.log`. Both must be launched via `open -a`.
+headlessly and write `/tmp/buriedanchor-selftest.log`. `--loginitem` round-trips the login-item
+registration and reports `SMAppService` status at each step. All must be launched via `open -a`.
 
 The multi-app test needs two distinct process names. Two instances of one binary collapse into a
 single row by design, so make renamed copies and ad-hoc sign them (copying breaks the original

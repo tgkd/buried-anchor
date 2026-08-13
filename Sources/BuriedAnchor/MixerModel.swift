@@ -21,9 +21,14 @@ final class MixerModel {
     private(set) var permission: CapturePermission = .unknown(noErr)
     private(set) var clipping = false
     private(set) var engineError: String?
+    private(set) var launchAtLogin = false
+    private(set) var loginItemNotice: String?
 
-    var softClip: Bool = false {
-        didSet { engine.renderer.setSoftClip(softClip) }
+    var softClip: Bool {
+        didSet {
+            UserDefaults.standard.set(softClip, forKey: softClipKey)
+            engine.renderer.setSoftClip(softClip)
+        }
     }
 
     var outputDeviceName: String { engine.outputDeviceName }
@@ -31,6 +36,7 @@ final class MixerModel {
     private let registry = ProcessRegistry()
     private let engine = TapEngine()
     private var percents: [String: Double] = [:]
+    private var premute: [String: Double] = [:]
     private var timer: Timer?
     private var processListListener: PropertyListener?
     private var tick = 0
@@ -44,15 +50,21 @@ final class MixerModel {
     private var lastPlaying: [String: LingerEntry] = [:]
     private let lingerInterval: TimeInterval = 300
     private let defaultsKey = "appVolumePercents"
+    private let premuteKey = "appVolumePremute"
+    private let softClipKey = "softClip"
 
     init() {
         percents = (UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: Double]) ?? [:]
+        premute = (UserDefaults.standard.dictionary(forKey: premuteKey) as? [String: Double]) ?? [:]
+        softClip = UserDefaults.standard.bool(forKey: softClipKey)
+        launchAtLogin = LoginItem.isEnabled
     }
 
     func start() {
         guard !started else { return }
         started = true
         permission = AudioCapturePermission.probe()
+        engine.renderer.setSoftClip(softClip)
         engine.start()
         processListListener = PropertyListener(
             systemObject,
@@ -93,18 +105,58 @@ final class MixerModel {
         engine.setGain(Float(percent / 100), for: id, objectIDs: objectIDs)
     }
 
+    func toggleMute(_ id: String) {
+        let current = rows.first { $0.id == id }?.percent ?? percents[id] ?? 100
+        if current > 0 {
+            premute[id] = current
+            persistPremute()
+            setPercent(0, for: id)
+        } else {
+            let restored = premute[id].flatMap { $0 > 0 ? $0 : nil } ?? 100
+            premute.removeValue(forKey: id)
+            persistPremute()
+            setPercent(restored, for: id)
+        }
+    }
+
     func reset(_ id: String) {
         percents.removeValue(forKey: id)
         UserDefaults.standard.set(percents, forKey: defaultsKey)
+        premute.removeValue(forKey: id)
+        persistPremute()
         engine.release(id)
+        engineError = engine.lastError
         if let index = rows.firstIndex(where: { $0.id == id }) {
             rows[index].percent = 100
             rows[index].isControlled = false
+            rows[index].level = 0
         }
+    }
+
+    private func persistPremute() {
+        UserDefaults.standard.set(premute, forKey: premuteKey)
     }
 
     func recheckPermission() {
         permission = AudioCapturePermission.probe()
+    }
+
+    func refreshSettingsState() {
+        launchAtLogin = LoginItem.isEnabled
+        permission = AudioCapturePermission.probe()
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            try LoginItem.setEnabled(enabled)
+            loginItemNotice = LoginItem.requiresApproval
+                ? "Buried Anchor is waiting for approval in System Settings › General › Login Items."
+                : nil
+        } catch {
+            loginItemNotice = "Could not \(enabled ? "enable" : "disable") it: \(error.localizedDescription)"
+            log.error("login item toggle failed: \(error.localizedDescription, privacy: .public)")
+        }
+        launchAtLogin = LoginItem.isEnabled
     }
 
     private func onTick() {

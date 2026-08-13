@@ -10,6 +10,33 @@ enum SelfTest {
         CommandLine.arguments.contains("--selftest")
             || CommandLine.arguments.contains("--multi")
             || CommandLine.arguments.contains("--watch")
+            || CommandLine.arguments.contains("--loginitem")
+    }
+
+    static func runLoginItem() {
+        note("=== login item ===")
+        note("bundle=\(Bundle.main.bundlePath)")
+        note("status=\(LoginItem.statusName)")
+
+        let wasEnabled = LoginItem.isEnabled
+        do {
+            try LoginItem.setEnabled(true)
+            note("after register: status=\(LoginItem.statusName) isEnabled=\(LoginItem.isEnabled)")
+        } catch {
+            note("FAIL register: \(error.localizedDescription)")
+        }
+        if !wasEnabled {
+            do {
+                try LoginItem.setEnabled(false)
+                note("after unregister: status=\(LoginItem.statusName)")
+            } catch {
+                note("FAIL unregister: \(error.localizedDescription)")
+            }
+        } else {
+            note("left registered, it was already enabled before this run")
+        }
+        note("done")
+        NSApp.terminate(nil)
     }
 
     static func runWatch(model: MixerModel) {
