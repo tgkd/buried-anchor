@@ -11,7 +11,7 @@ struct AudioProcess {
 }
 
 struct AudioAppGroup: Identifiable, Equatable {
-    let id: String
+    let id: SourceID
     let name: String
     let icon: NSImage?
     let objectIDs: [AudioObjectID]
@@ -28,18 +28,21 @@ struct AudioAppGroup: Identifiable, Equatable {
 @MainActor
 final class ProcessRegistry {
     private struct CachedOwner {
-        let key: String
+        let key: SourceID
         let started: UInt64
     }
 
     private var ownerCache: [pid_t: CachedOwner] = [:]
-    private var appCache: [String: NSRunningApplication] = [:]
+    private var appCache: [SourceID: NSRunningApplication] = [:]
     private let ownPID = ProcessInfo.processInfo.processIdentifier
+
+    private(set) var objectIDs: Set<AudioObjectID> = []
 
     func snapshot() -> [AudioAppGroup] {
         let processes = currentProcesses()
-        var members: [String: [AudioProcess]] = [:]
-        var display: [String: (name: String, app: NSRunningApplication?)] = [:]
+        objectIDs = Set(processes.map(\.objectID))
+        var members: [SourceID: [AudioProcess]] = [:]
+        var display: [SourceID: (name: String, app: NSRunningApplication?)] = [:]
 
         for process in processes where process.pid != ownPID {
             guard let identity = identify(process) else { continue }
@@ -52,7 +55,7 @@ final class ProcessRegistry {
         let groups = members.map { key, procs in
             AudioAppGroup(
                 id: key,
-                name: display[key]?.name ?? key,
+                name: display[key]?.name ?? key.fallbackName,
                 icon: display[key]?.app?.icon,
                 objectIDs: procs.map(\.objectID).sorted(),
                 isPlaying: procs.contains(where: \.isRunningOutput)
@@ -83,33 +86,35 @@ final class ProcessRegistry {
 
     private func identify(
         _ process: AudioProcess
-    ) -> (key: String, name: String, app: NSRunningApplication?)? {
+    ) -> (key: SourceID, name: String, app: NSRunningApplication?)? {
         let started = processInfo(of: process.pid)?.started
 
         if let cached = ownerCache[process.pid], cached.started == started,
            let app = appCache[cached.key] {
-            return (cached.key, app.localizedName ?? cached.key, app)
+            return (cached.key, app.localizedName ?? cached.key.fallbackName, app)
         }
         ownerCache.removeValue(forKey: process.pid)
 
         if let app = owningApplication(of: process.pid) {
-            let key = app.bundleIdentifier ?? "pid:\(app.processIdentifier)"
+            let key = app.bundleIdentifier.map(SourceID.bundle)
+                ?? SourceID.ephemeral(app.processIdentifier)
             if let started {
                 ownerCache[process.pid] = CachedOwner(key: key, started: started)
             }
             appCache[key] = app
-            return (key, app.localizedName ?? key, app)
+            return (key, app.localizedName ?? key.fallbackName, app)
         }
 
         guard process.isRunningOutput else { return nil }
 
         if let executable = executableName(of: process.pid) {
-            return ("exec:\(executable)", executable, nil)
+            return (.executable(executable), executable, nil)
         }
         if let bundleID = process.bundleID {
-            return (bundleID, shortName(fromBundleID: bundleID), nil)
+            let key = SourceID.bundle(bundleID)
+            return (key, key.fallbackName, nil)
         }
-        return ("pid:\(process.pid)", "PID \(process.pid)", nil)
+        return (.ephemeral(process.pid), "PID \(process.pid)", nil)
     }
 
     private func owningApplication(of pid: pid_t) -> NSRunningApplication? {
@@ -150,13 +155,8 @@ final class ProcessRegistry {
         processInfo(of: pid)?.name
     }
 
-    private func shortName(fromBundleID bundleID: String) -> String {
-        bundleID.split(separator: ".").last.map(String.init) ?? bundleID
-    }
-
     func forgetTerminated() {
-        let live = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
-        appCache = appCache.filter { key, app in live.contains(key) && !app.isTerminated }
+        appCache = appCache.filter { !$0.value.isTerminated }
         ownerCache = ownerCache.filter { appCache[$0.value.key] != nil }
     }
 }

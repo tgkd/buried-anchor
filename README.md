@@ -49,18 +49,32 @@ and every captured sample arrives as `0.0` while the IOProc keeps firing normall
 One tap per controlled app, all taps in a **single private aggregate device** built around the
 current default output device, with one `AudioDeviceIOProcID` on it.
 
-- Each sub-tap contributes its own input stream to the aggregate. Input buffer index equals the
-  tap's position in `kAudioAggregateDeviceTapListKey`, which is how a buffer maps back to an app.
+- Each sub-tap contributes its own input stream to the aggregate. Which input buffer belongs to
+  which app is **discovered after the aggregate comes up**, not assumed: the tap order is read back
+  from `kAudioAggregateDevicePropertyTapList`, and the taps are located inside the aggregate's input
+  buffer list by matching their channel counts, so any input streams a duplex sub-device contributes
+  ahead of them are skipped rather than rendered as somebody's audio.
+- The output side is mapped the same way. Every output stream's channel is given an explicit
+  buffer/offset/stride, so non-interleaved devices get both buffers written and multichannel devices
+  get the mix on their front pair with the rest cleared. A layout we cannot map — not 32-bit float,
+  no output channels, taps that don't line up — is rejected: the graph is torn down, the panel shows
+  why, and every app stays on its own direct output.
 - Taps use `.mutedWhenTapped`, so an app's direct path is silenced only while we are reading it.
-  We then re-render it at the chosen gain into the aggregate's single output buffer.
-- Gain is applied with `vDSP_vrampmuladd`, which multiplies by a per-sample ramp and accumulates
+  We then re-render it at the chosen gain into the aggregate's output buffers.
+- Gain is applied with `vDSP_vrampmuladd`, which multiplies by a per-frame ramp and accumulates
   into the output — gain and summing in one pass, with a 30 ms ramp so slider moves don't zipper.
-- An app gets a tap the first time its slider leaves 100%, and keeps it for the session. Apps you
-  never touch stay entirely outside the graph and are bit-transparent.
-- Once every controlled app is back at exactly 100%, the engine suspends itself after 1.5 s: the
-  IOProc is torn down while the taps and the aggregate stay alive. Each app returns to its own
-  bit-transparent output, and macOS drops the purple system-audio indicator. Any slider leaving
-  100% resumes it immediately, which costs one `AudioDeviceStart` rather than a rebuild.
+- An app gets a tap the first time its slider leaves 100%, or as soon as it appears with a volume
+  you saved earlier — before it starts playing, so the first notification chime is already at the
+  level you chose. Apps you never touch stay entirely outside the graph and are bit-transparent.
+- Once every controlled app is back at exactly 100%, *or* once none of them is running any more, the
+  engine suspends itself after 1.5 s: the IOProc is torn down while the taps and the aggregate stay
+  alive. Each app returns to its own bit-transparent output, and macOS drops the purple system-audio
+  indicator. Any slider leaving 100% resumes it immediately, which costs one `AudioDeviceStart`
+  rather than a rebuild.
+- A tap whose app has been gone for five minutes is released, but only while the engine is suspended
+  or nothing controlled is playing, so reclaiming a slot never interrupts audio. Your saved volume
+  is kept; only the runtime tap goes. At the 32-slot cap a playing app can evict the
+  least-recently-active idle one.
 
 Above 100% the output can exceed full scale. Default is a hard clip at ±1.0 with a clip indicator;
 Settings › Soft clip switches to `tanhf` saturation above a 0.7 knee.
@@ -81,35 +95,59 @@ Settings (⌘, or the gear in the panel) holds "Launch at login", registered thr
 
 ## Verified behavior
 
-Measured on macOS 27.0 (arm64) against a generated 0.20-amplitude tone:
+Measured on macOS 27.0 (arm64). Two players run the same 90 s tone at different source volumes so a
+crossed slot would show up in the numbers: player A peaks at `0.0073`, player B at `0.0018`.
 
 | Check | Result |
 |---|---|
 | Permission probe | `granted` (`kAudioTapPropertyDescription` set returns `noErr`) |
-| Gain at 150% | output peak `0.3000` = 0.20 × 1.5, exact |
-| Mute at 0% | `0.0059`, decaying to zero |
-| Two apps, one aggregate | separate streams, peaks `0.19999` / `0.05002`, no bleed |
-| Two apps controlled at once | sources 0.10 / 0.04 at 50% / 150% → `0.0500` / `0.0600` |
-| Gains swapped between them | → `0.1498` / `0.0206`, slot mapping holds, no crossover |
-| One muted, other untouched | `0.0061` (decay) / `0.0206` unchanged |
-| Default output change mid-playback | rebuilt on new device, peak held, no error |
-| Helper grouping | Slack's 2 process objects collapse to one "Slack" row |
-| Processes with no bundle ID | fall back to executable name (`exec:afplay`) |
-| Suspend at 100% | 50% → `0.1250`, 100% → `0.0049` (no render), 50% again → `0.1251`, tap kept |
-| Fractional slider values | `100.19` saved → rounds to `100` on load → no tap created |
+| Gain at 150% | `0.0110` = 0.0073 × 1.5, exact |
+| Mute at 0% | `0.0000` |
+| Two apps controlled at once | 50% / 150% → `0.0037` / `0.0027` |
+| Gains swapped between them | → `0.0110` / `0.0009`; each row still tracks its **own** source amplitude, so the slot mapping did not cross |
+| One muted, other untouched | `0.0000` / `0.0009` unchanged |
+| Three taps in one aggregate | slots on input buffers 0,1,2, no error |
+| Suspend at 100% | 50% → `0.0037`, 100% → `0.0002` (no render), 50% again → `0.0037`, tap kept |
+| Suspend when the app exits | controlled app killed → graph suspends while its tap is kept |
+| Saved volume applied before playback | app relaunched with a saved 50% is tapped as it appears |
+| Default output change mid-playback | Bluetooth → built-in → Bluetooth, peak held at `0.0110` across both, slots preserved, no error |
+| Layout on built-in speakers | `inputBuffers=[2]` for 1 tap, offset 0, output `[2]` interleaved float32 |
+| Layout on a Bluetooth headset with a mic | `inputBuffers=[2,2]` for 2 taps, offset 0 — macOS exposes the mic as a **separate** device object, so it contributes no input stream |
+| Renderer and layout resolver | 20 hardware-free checks, exit code 0 |
 
-`--selftest <match> <percent> [--switch]` and `--multi <matchA> <pctA> <matchB> <pctB>` run these
-headlessly and write `/tmp/buriedanchor-selftest.log`. `--suspend <match>` cycles one app
-50% → 100% → 50% and checks that the middle step stops rendering while keeping the tap.
-`--loginitem` round-trips the login-item registration and reports `SMAppService` status at each
-step. All must be launched via `open -a`.
+Carried over from the previous build and not re-measured: helper grouping (Slack's two process
+objects collapse to one row), fallback to `exec:<name>` for processes with no bundle ID, and
+`100.19` rounding to `100` on load so no tap is created.
 
-The multi-app test needs two distinct process names. Two instances of one binary collapse into a
-single row by design, so make renamed copies and ad-hoc sign them (copying breaks the original
-signature and the copy will not launch):
+The duplex case that the tap-offset discovery exists for — a sub-device that contributes its own
+input streams ahead of the taps — has **not** been reproduced on real hardware. The Bluetooth
+headset above does not do it. It is covered synthetically by `--render`.
+
+### Self-test modes
+
+All except `--render` must be launched via `open -a`, need real audio playing, append to
+`/tmp/buriedanchor-selftest.log`, and end with a `RESULT pass` / `RESULT fail (n)` line. They restore
+whatever volume the app had before the run.
+
+| Mode | What it checks |
+|---|---|
+| `--render` | layout resolution and rendering against synthetic buffer lists — no HAL, no TCC, no audio. The only mode that may be run as the inner binary, which is how you get an exit code |
+| `--layout <match>` | dumps the live aggregate's tap list, sub-taps, per-stream formats and buffer shapes |
+| `--selftest <match> <pct> [--switch]` | boost, mute, and optionally a default-device switch mid-playback |
+| `--multi <a> <pctA> <b> <pctB>` | two sources, gains swapped, then one muted |
+| `--suspend <match>` | 50% → 100% → 50%, checking the middle step stops rendering but keeps the tap |
+| `--watch <seconds>` | dumps the row list every 3 s; `*` playing, `!` rendering, `?` tapped but idle |
+| `--loginitem` | round-trips the login-item registration |
+
+The multi-app test needs two distinct rows, and row identity follows the *owning* app up the parent
+chain — an `afplay` you start in a terminal groups under the terminal, not under itself. Wrap it in
+a throwaway bundle per player to get its own row:
 
 ```
-cp /usr/bin/afplay /tmp/tonePlayerA && codesign --force --sign - /tmp/tonePlayerA
+mkdir -p PlayerA.app/Contents/MacOS && cp /usr/bin/afplay PlayerA.app/Contents/MacOS/PlayerA
+# Info.plist with CFBundleIdentifier com.example.PlayerA and LSUIElement
+codesign --force --sign - PlayerA.app
+open -a "$PWD/PlayerA.app" --args -v 0.03 tone.wav
 ```
 
 ## The row list and the waveform
@@ -130,6 +168,9 @@ up bit-transparency at unity and routes audio you never asked us to touch throug
 
 - Only apps playing to the **default output device** are affected. An app pinned to a different
   device is captured but its scaled audio lands on the default device.
+- Every tap is a `stereoMixdownOfProcesses`, so a multichannel or spatial source is folded to stereo
+  once you control it. On a multichannel output the mix lands on the front pair and the remaining
+  channels are silent. Leaving such an app at 100% keeps it untapped and untouched.
 - Adding or removing a controlled app rebuilds the shared aggregate, which briefly interrupts the
   other controlled apps. Changing a gain does not.
 - Some processes cannot be traced to a user-visible app (`com.apple.WebKit.GPU` hosting Raycast

@@ -7,7 +7,7 @@ import Observation
 @Observable
 final class MixerModel {
     struct Row: Identifiable {
-        let id: String
+        let id: SourceID
         var name: String
         var icon: NSImage?
         var objectIDs: [AudioObjectID]
@@ -15,6 +15,7 @@ final class MixerModel {
         var percent: Double
         var level: Float
         var isControlled: Bool
+        var isActive: Bool
     }
 
     private(set) var rows: [Row] = []
@@ -23,45 +24,52 @@ final class MixerModel {
     private(set) var engineError: String?
     private(set) var launchAtLogin = false
     private(set) var loginItemNotice: String?
+    private(set) var outputDeviceName = "-"
 
     var softClip: Bool {
         didSet {
-            UserDefaults.standard.set(softClip, forKey: softClipKey)
+            UserDefaults.standard.set(softClip, forKey: Self.softClipKey)
             engine.renderer.setSoftClip(softClip)
         }
     }
 
-    var outputDeviceName: String { engine.outputDeviceName }
+    private struct Presentation {
+        let name: String
+        let icon: NSImage?
+    }
 
     private let registry = ProcessRegistry()
     private let engine = TapEngine()
-    private var percents: [String: Double] = [:]
-    private var premute: [String: Double] = [:]
+    private var percents: [SourceID: Double] = [:]
+    private var premute: [SourceID: Double] = [:]
     private var timer: Timer?
     private var processListListener: PropertyListener?
+    private var activityListeners: [AudioObjectID: PropertyListener] = [:]
+    private var reconcilePending = false
     private var tick = 0
-    private var unityTicks = 0
-    private let suspendAfterTicks = 15
+    private var unitySince: Date?
     private var started = false
-    private struct LingerEntry {
-        let name: String
-        let icon: NSImage?
-        let at: Date
-    }
+    private var presentation: [SourceID: Presentation] = [:]
+    private var lastPlaying: [SourceID: Date] = [:]
+    private var lastLive: [SourceID: Date] = [:]
+    private var liveKeys: Set<SourceID> = []
+    private var playingKeys: Set<SourceID> = []
 
-    private var lastPlaying: [String: LingerEntry] = [:]
+    private let suspendAfter: TimeInterval = 1.5
+    private let meterFloor: Float = 0.0002
     private let lingerInterval: TimeInterval = 300
-    private let defaultsKey = "appVolumePercents"
-    private let premuteKey = "appVolumePremute"
-    private let softClipKey = "softClip"
+    private let tapRetention: TimeInterval = 300
+    private static let defaultsKey = "appVolumePercents"
+    private static let premuteKey = "appVolumePremute"
+    private static let softClipKey = "softClip"
 
     init() {
-        percents = ((UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: Double]) ?? [:])
-            .mapValues { $0.rounded() }
-        premute = ((UserDefaults.standard.dictionary(forKey: premuteKey) as? [String: Double]) ?? [:])
-            .mapValues { $0.rounded() }
-        softClip = UserDefaults.standard.bool(forKey: softClipKey)
+        percents = Self.loadPercents(Self.defaultsKey)
+        premute = Self.loadPercents(Self.premuteKey)
+        softClip = UserDefaults.standard.bool(forKey: Self.softClipKey)
         launchAtLogin = LoginItem.isEnabled
+        normalizeStorage(Self.defaultsKey, percents)
+        normalizeStorage(Self.premuteKey, premute)
     }
 
     func start() {
@@ -70,12 +78,13 @@ final class MixerModel {
         permission = AudioCapturePermission.probe()
         engine.renderer.setSoftClip(softClip)
         engine.start()
+        outputDeviceName = engine.outputDeviceName
         processListListener = PropertyListener(
             systemObject,
             propertyAddress(kAudioHardwarePropertyProcessObjectList),
             queue: .main
         ) { [weak self] in
-            Task { @MainActor in self?.refreshList() }
+            Task { @MainActor in self?.scheduleReconcile() }
         }
         refreshList()
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -87,76 +96,60 @@ final class MixerModel {
         timer?.invalidate()
         timer = nil
         processListListener = nil
+        activityListeners.removeAll()
         engine.shutdown()
     }
 
-    func setPercent(_ value: Double, for id: String) {
+    func savedPercent(for id: SourceID) -> Double? { percents[id] }
+
+    func setPercent(_ value: Double, for id: SourceID) {
         let clamped = min(max(value, 0), 150).rounded()
         percents[id] = clamped
-        UserDefaults.standard.set(percents, forKey: defaultsKey)
+        persist(percents, forKey: Self.defaultsKey)
         guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
         rows[index].percent = clamped
         if !permission.isGranted {
             permission = AudioCapturePermission.probe()
         }
+        if clamped != 100 {
+            _ = claimSlot(for: id, force: true)
+        }
         applyGain(clamped, for: id, objectIDs: rows[index].objectIDs)
         rows[index].isControlled = engine.isControlled(id)
+        rows[index].isActive = engine.isActive(id)
         engineError = engine.lastError
-        unityTicks = 0
+        unitySince = nil
         updateSuspension()
     }
 
-    private func updateSuspension() {
-        let keys = engine.controlledKeys
-        guard !keys.isEmpty else {
-            unityTicks = 0
-            return
-        }
-        guard keys.allSatisfy({ engine.gain(for: $0) == 1 }) else {
-            unityTicks = 0
-            engine.resume()
-            return
-        }
-        guard unityTicks < suspendAfterTicks else { return }
-        unityTicks += 1
-        if unityTicks == suspendAfterTicks { engine.suspend() }
-    }
-
-    private func applyGain(_ percent: Double, for id: String, objectIDs: [AudioObjectID]) {
-        guard permission.isGranted || engine.isControlled(id) else { return }
-        engine.setGain(Float(percent / 100), for: id, objectIDs: objectIDs)
-    }
-
-    func toggleMute(_ id: String) {
+    func toggleMute(_ id: SourceID) {
         let current = rows.first { $0.id == id }?.percent ?? percents[id] ?? 100
         if current > 0 {
             premute[id] = current
-            persistPremute()
+            persist(premute, forKey: Self.premuteKey)
             setPercent(0, for: id)
         } else {
             let restored = premute[id].flatMap { $0 > 0 ? $0 : nil } ?? 100
             premute.removeValue(forKey: id)
-            persistPremute()
+            persist(premute, forKey: Self.premuteKey)
             setPercent(restored, for: id)
         }
     }
 
-    func reset(_ id: String) {
+    func reset(_ id: SourceID) {
         percents.removeValue(forKey: id)
-        UserDefaults.standard.set(percents, forKey: defaultsKey)
+        persist(percents, forKey: Self.defaultsKey)
         premute.removeValue(forKey: id)
-        persistPremute()
+        persist(premute, forKey: Self.premuteKey)
         engine.release(id)
+        lastLive.removeValue(forKey: id)
         engineError = engine.lastError
         if let index = rows.firstIndex(where: { $0.id == id }) {
             rows[index].percent = 100
             rows[index].isControlled = false
+            rows[index].isActive = false
             rows[index].level = 0
         }
-    }
-
-    private func persistPremute() {
-        UserDefaults.standard.set(premute, forKey: premuteKey)
     }
 
     func recheckPermission() {
@@ -181,36 +174,147 @@ final class MixerModel {
         launchAtLogin = LoginItem.isEnabled
     }
 
+    func engineDiagnostics() -> [String] { engine.diagnostics() }
+
+    private static func loadPercents(_ key: String) -> [SourceID: Double] {
+        let stored = (UserDefaults.standard.dictionary(forKey: key) as? [String: Double]) ?? [:]
+        var result: [SourceID: Double] = [:]
+        for (raw, value) in stored where value.isFinite {
+            let id = SourceID(raw: raw)
+            guard id.isDurable else { continue }
+            result[id] = min(max(value, 0), 150).rounded()
+        }
+        return result
+    }
+
+    private func normalizeStorage(_ key: String, _ values: [SourceID: Double]) {
+        let stored = (UserDefaults.standard.dictionary(forKey: key) as? [String: Double]) ?? [:]
+        let normalized = Self.encode(values)
+        guard stored != normalized else { return }
+        log.debug("normalized \(key, privacy: .public): \(stored.count) -> \(normalized.count) entries")
+        UserDefaults.standard.set(normalized, forKey: key)
+    }
+
+    private static func encode(_ values: [SourceID: Double]) -> [String: Double] {
+        values.reduce(into: [String: Double]()) { result, entry in
+            guard entry.key.isDurable else { return }
+            result[entry.key.raw] = entry.value
+        }
+    }
+
+    private func persist(_ values: [SourceID: Double], forKey key: String) {
+        UserDefaults.standard.set(Self.encode(values), forKey: key)
+    }
+
+    private func applyGain(_ percent: Double, for id: SourceID, objectIDs: [AudioObjectID]) {
+        guard permission.isGranted || engine.isControlled(id) else { return }
+        engine.setGain(Float(percent / 100), for: id, objectIDs: objectIDs)
+        if engine.isControlled(id) { lastLive[id] = Date() }
+    }
+
+    private func claimSlot(for id: SourceID, force: Bool = false) -> Bool {
+        if engine.isControlled(id) { return true }
+        guard engine.controlledCount >= MixRenderer.maxSlots else { return true }
+        guard force || playingKeys.contains(id) else { return false }
+        let victims = engine.controlledKeys
+            .filter { !playingKeys.contains($0) }
+            .sorted { (lastLive[$0] ?? .distantPast) < (lastLive[$1] ?? .distantPast) }
+        guard let victim = victims.first else { return false }
+        log.debug("evicting \(victim.raw, privacy: .public) to make room for \(id.raw, privacy: .public)")
+        engine.release(victim)
+        lastLive.removeValue(forKey: victim)
+        return true
+    }
+
+    private func updateSuspension() {
+        let keys = engine.controlledKeys
+        guard !keys.isEmpty else {
+            unitySince = nil
+            return
+        }
+        let atUnity = keys.allSatisfy { engine.gain(for: $0) == 1 }
+        let anyLive = keys.contains { liveKeys.contains($0) }
+        guard atUnity || !anyLive else {
+            unitySince = nil
+            engine.resume()
+            return
+        }
+        let now = Date()
+        let since = unitySince ?? now
+        unitySince = since
+        guard now.timeIntervalSince(since) >= suspendAfter else { return }
+        engine.suspend()
+    }
+
+    private func scheduleReconcile() {
+        guard !reconcilePending else { return }
+        reconcilePending = true
+        Task { @MainActor in
+            self.reconcilePending = false
+            self.refreshList()
+        }
+    }
+
+    private func syncActivityListeners() {
+        let objectIDs = registry.objectIDs
+        for objectID in activityListeners.keys where !objectIDs.contains(objectID) {
+            activityListeners.removeValue(forKey: objectID)
+        }
+        for objectID in objectIDs where activityListeners[objectID] == nil {
+            activityListeners[objectID] = PropertyListener(
+                objectID,
+                propertyAddress(kAudioProcessPropertyIsRunningOutput),
+                queue: .main
+            ) { [weak self] in
+                Task { @MainActor in self?.scheduleReconcile() }
+            }
+        }
+    }
+
     private func onTick() {
         tick += 1
+        engine.retryIfDue()
         if tick % 10 == 0 {
             refreshList()
             registry.forgetTerminated()
         }
         refreshMeters()
         updateSuspension()
+        if outputDeviceName != engine.outputDeviceName {
+            outputDeviceName = engine.outputDeviceName
+        }
+        if engineError != engine.lastError {
+            engineError = engine.lastError
+        }
     }
 
     private func refreshList() {
         let groups = registry.snapshot()
-        let controlled = Set(engine.controlledKeys)
+        syncActivityListeners()
         let now = Date()
-        var next: [Row] = []
-        next.reserveCapacity(groups.count)
+        liveKeys = Set(groups.filter { !$0.objectIDs.isEmpty }.map(\.id))
+        playingKeys = Set(groups.filter(\.isPlaying).map(\.id))
 
         for group in groups {
-            if controlled.contains(group.id) {
+            presentation[group.id] = Presentation(name: group.name, icon: group.icon)
+            if group.isPlaying { lastPlaying[group.id] = now }
+            if engine.isControlled(group.id) {
                 engine.syncObjectIDs(group.objectIDs, for: group.id)
-            } else if let saved = percents[group.id], saved != 100, group.isPlaying {
-                applyGain(saved, for: group.id, objectIDs: group.objectIDs)
+                lastLive[group.id] = now
+                continue
             }
-            if group.isPlaying {
-                lastPlaying[group.id] = LingerEntry(name: group.name, icon: group.icon, at: now)
-            }
+            guard let saved = percents[group.id], saved != 100, !group.objectIDs.isEmpty,
+                  claimSlot(for: group.id)
+            else { continue }
+            applyGain(saved, for: group.id, objectIDs: group.objectIDs)
+        }
+
+        var next: [Row] = []
+        next.reserveCapacity(groups.count)
+        for group in groups {
             let saved = percents[group.id] ?? 100
-            let recentlyPlayed = lastPlaying[group.id]
-                .map { now.timeIntervalSince($0.at) < lingerInterval } ?? false
-            guard group.isPlaying || recentlyPlayed || controlled.contains(group.id) || saved != 100
+            let recent = lastPlaying[group.id].map { now.timeIntervalSince($0) < lingerInterval } ?? false
+            guard group.isPlaying || recent || engine.isControlled(group.id) || saved != 100
             else { continue }
             next.append(
                 Row(
@@ -221,44 +325,28 @@ final class MixerModel {
                     isPlaying: group.isPlaying,
                     percent: saved,
                     level: rows.first { $0.id == group.id }?.level ?? 0,
-                    isControlled: false
+                    isControlled: engine.isControlled(group.id),
+                    isActive: engine.isActive(group.id)
                 )
             )
         }
 
-        let live = Set(engine.controlledKeys)
-        for index in next.indices {
-            next[index].isControlled = live.contains(next[index].id)
-        }
-
-        for key in live where !next.contains(where: { $0.id == key }) {
+        let known = Set(next.map(\.id))
+        let absent = Set(engine.controlledKeys).union(
+            lastPlaying.filter { now.timeIntervalSince($0.value) < lingerInterval }.keys
+        ).subtracting(known)
+        for key in absent {
             next.append(
                 Row(
                     id: key,
-                    name: key,
-                    icon: nil,
+                    name: presentation[key]?.name ?? key.fallbackName,
+                    icon: presentation[key]?.icon,
                     objectIDs: [],
                     isPlaying: false,
                     percent: percents[key] ?? 100,
                     level: 0,
-                    isControlled: true
-                )
-            )
-        }
-
-        for (key, entry) in lastPlaying
-        where now.timeIntervalSince(entry.at) < lingerInterval
-            && !next.contains(where: { $0.id == key }) {
-            next.append(
-                Row(
-                    id: key,
-                    name: entry.name,
-                    icon: entry.icon,
-                    objectIDs: [],
-                    isPlaying: false,
-                    percent: percents[key] ?? 100,
-                    level: 0,
-                    isControlled: false
+                    isControlled: engine.isControlled(key),
+                    isActive: false
                 )
             )
         }
@@ -268,9 +356,34 @@ final class MixerModel {
             return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
 
-        lastPlaying = lastPlaying.filter { now.timeIntervalSince($0.value.at) < lingerInterval }
+        lastPlaying = lastPlaying.filter { now.timeIntervalSince($0.value) < lingerInterval }
+        presentation = presentation.filter {
+            liveKeys.contains($0.key) || lastPlaying[$0.key] != nil
+                || percents[$0.key] != nil || engine.isControlled($0.key)
+        }
         rows = next
+        sweepRetention(now)
         engineError = engine.lastError
+        outputDeviceName = engine.outputDeviceName
+        updateSuspension()
+    }
+
+    private func sweepRetention(_ now: Date) {
+        let controlled = engine.controlledKeys
+        guard !controlled.isEmpty else { return }
+        for key in controlled where liveKeys.contains(key) { lastLive[key] = now }
+        let expired = controlled.filter { now.timeIntervalSince(lastLive[$0] ?? now) > tapRetention }
+        guard !expired.isEmpty else { return }
+        let busy = controlled.contains { playingKeys.contains($0) }
+        guard engine.isSuspended || !busy else { return }
+        log.debug("retention released \(expired.map(\.raw).joined(separator: ","), privacy: .public)")
+        engine.release(expired)
+        for key in expired { lastLive.removeValue(forKey: key) }
+        for index in rows.indices where expired.contains(rows[index].id) {
+            rows[index].isControlled = false
+            rows[index].isActive = false
+            rows[index].level = 0
+        }
     }
 
     private func refreshMeters() {
@@ -282,12 +395,10 @@ final class MixerModel {
         for (slot, key) in keys.enumerated() {
             let peak = engine.renderer.takePeak(slot: slot)
             guard let index = rows.firstIndex(where: { $0.id == key }) else { continue }
-            let next = max(peak, rows[index].level * 0.7)
-            if abs(next - rows[index].level) > 0.002 {
-                rows[index].level = next
-            } else if next == 0 && rows[index].level != 0 {
-                rows[index].level = 0
-            }
+            var next = max(peak, rows[index].level * 0.7)
+            if next < meterFloor { next = 0 }
+            guard next != rows[index].level else { continue }
+            rows[index].level = next
         }
         let isClipping = engine.renderer.takeClipCount() > 0
         if isClipping != clipping { clipping = isClipping }

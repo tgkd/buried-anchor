@@ -33,13 +33,17 @@ extension AudioObjectID {
         return Array(UnsafeBufferPointer(start: buffer, count: Int(size2) / MemoryLayout<T>.stride))
     }
 
-    func value<T>(_ address: AudioObjectPropertyAddress, default fallback: T) -> T {
+    func optionalValue<T>(_ address: AudioObjectPropertyAddress, of type: T.Type) -> T? {
         var address = address
         var size = UInt32(MemoryLayout<T>.size)
         let buffer = UnsafeMutablePointer<T>.allocate(capacity: 1)
         defer { buffer.deallocate() }
-        guard AudioObjectGetPropertyData(self, &address, 0, nil, &size, buffer) == noErr else { return fallback }
+        guard AudioObjectGetPropertyData(self, &address, 0, nil, &size, buffer) == noErr else { return nil }
         return buffer.pointee
+    }
+
+    func value<T>(_ address: AudioObjectPropertyAddress, default fallback: T) -> T {
+        optionalValue(address, of: T.self) ?? fallback
     }
 
     func string(_ address: AudioObjectPropertyAddress) -> String? {
@@ -53,6 +57,17 @@ extension AudioObjectID {
         return raw.takeRetainedValue() as String
     }
 
+    func stringArray(_ address: AudioObjectPropertyAddress) -> [String] {
+        var address = address
+        var size = UInt32(MemoryLayout<CFArray?>.size)
+        var raw: Unmanaged<CFArray>?
+        let status = withUnsafeMutablePointer(to: &raw) { pointer in
+            AudioObjectGetPropertyData(self, &address, 0, nil, &size, pointer)
+        }
+        guard status == noErr, let raw else { return [] }
+        return (raw.takeRetainedValue() as NSArray).compactMap { $0 as? String }
+    }
+
     func streamChannelCounts(_ scope: AudioObjectPropertyScope) -> [Int] {
         let address = propertyAddress(kAudioDevicePropertyStreamConfiguration, scope)
         guard let size = dataSize(address), size > 0 else { return [] }
@@ -63,6 +78,24 @@ extension AudioObjectID {
         guard AudioObjectGetPropertyData(self, &address2, 0, nil, &size2, raw) == noErr else { return [] }
         let list = UnsafeMutableAudioBufferListPointer(raw.assumingMemoryBound(to: AudioBufferList.self))
         return list.map { Int($0.mNumberChannels) }
+    }
+
+    func streams(_ scope: AudioObjectPropertyScope) -> [AudioObjectID] {
+        array(propertyAddress(kAudioDevicePropertyStreams, scope), of: AudioObjectID.self)
+    }
+
+    var virtualFormat: AudioStreamBasicDescription? {
+        optionalValue(
+            propertyAddress(kAudioStreamPropertyVirtualFormat), of: AudioStreamBasicDescription.self
+        )
+    }
+}
+
+extension AudioStreamBasicDescription {
+    var isFloat32: Bool {
+        mFormatID == kAudioFormatLinearPCM
+            && mFormatFlags & kAudioFormatFlagIsFloat != 0
+            && mBitsPerChannel == 32
     }
 }
 

@@ -22,6 +22,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = MixerModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--render") {
+            SelfTest.runRender()
+            return
+        }
+        if CommandLine.arguments.contains("--layout") {
+            SelfTest.runLayout(model: model)
+            return
+        }
         if CommandLine.arguments.contains("--loginitem") {
             SelfTest.runLoginItem()
             return
@@ -207,7 +215,7 @@ struct AppRow: View {
                 WaveformIndicator(
                     isPlaying: row.isPlaying,
                     level: row.level,
-                    isMeasured: row.isControlled
+                    isMeasured: row.isActive
                 )
                 Spacer(minLength: 0)
             }

@@ -4,29 +4,59 @@ import Foundation
 
 @MainActor
 final class TapEngine {
+    enum State: Equatable {
+        case idle
+        case active
+        case suspended
+        case failed(String)
+
+        var isFailed: Bool { if case .failed = self { true } else { false } }
+    }
+
     private struct Tap {
         let tapID: AudioObjectID
         let uuid: UUID
         var objectIDs: [AudioObjectID]
     }
 
+    private struct DeviceSignature: Equatable, CustomStringConvertible {
+        let uid: String
+        let channels: [Int]
+        let sampleRate: Double
+
+        static let none = DeviceSignature(uid: "", channels: [], sampleRate: 0)
+
+        var description: String { "\(uid) ch=\(channels) rate=\(Int(sampleRate))" }
+    }
+
     private static let aggregateUIDPrefix = "com.buriedanchor.aggregate."
+    private static let retryDelays: [TimeInterval] = [1, 2, 5, 15, 30]
 
     let renderer = MixRenderer()
 
-    private var taps: [String: Tap] = [:]
-    private var order: [String] = []
-    private var gains: [String: Float] = [:]
+    private var taps: [SourceID: Tap] = [:]
+    private var order: [SourceID] = []
+    private var gains: [SourceID: Float] = [:]
+    private var doomed: [Tap] = []
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
-    private var isSuspended = false
+    private var outputDeviceID = AudioObjectID(kAudioObjectUnknown)
+    private var signature = DeviceSignature.none
+    private var sampleRate: Double = 48000
     private let ioQueue = DispatchQueue(label: "com.buriedanchor.ioproc", qos: .userInteractive)
     private var defaultDeviceListener: PropertyListener?
+    private var deviceListeners: [PropertyListener] = []
+    private var retryIndex = 0
+    private var retryAt: Date?
 
+    private(set) var state: State = .idle
     private(set) var lastError: String?
     private(set) var outputDeviceName: String = "-"
+    private(set) var layoutSummary: String = "-"
 
-    var controlledKeys: [String] { order }
+    var controlledKeys: [SourceID] { order }
+    var controlledCount: Int { order.count }
+    var isSuspended: Bool { state == .suspended }
 
     func start() {
         defaultDeviceListener = PropertyListener(
@@ -34,35 +64,38 @@ final class TapEngine {
             propertyAddress(kAudioHardwarePropertyDefaultOutputDevice),
             queue: .main
         ) { [weak self] in
-            Task { @MainActor in self?.handleDefaultDeviceChange() }
+            Task { @MainActor in self?.handleRouteChange("default output device") }
         }
         refreshOutputDeviceName()
     }
 
     func shutdown() {
-        teardownIO()
-        destroyAggregate()
-        for tap in taps.values { AudioHardwareDestroyProcessTap(tap.tapID) }
+        stopGraph()
+        defaultDeviceListener = nil
+        for (key, tap) in taps { destroy(tap, key: key) }
         taps.removeAll()
         order.removeAll()
+        destroyDoomedTaps()
+        state = .idle
     }
 
-    func isControlled(_ key: String) -> Bool { taps[key] != nil }
+    func isControlled(_ key: SourceID) -> Bool { taps[key] != nil }
 
-    func gain(for key: String) -> Float { gains[key] ?? 1 }
+    func isActive(_ key: SourceID) -> Bool { state == .active && taps[key] != nil }
 
-    func setGain(_ gain: Float, for key: String, objectIDs: [AudioObjectID]) {
+    func gain(for key: SourceID) -> Float { gains[key] ?? 1 }
+
+    func setGain(_ gain: Float, for key: SourceID, objectIDs: [AudioObjectID]) {
         gains[key] = gain
         if taps[key] == nil {
-            guard gain != 1 else { return }
-            guard !objectIDs.isEmpty else { return }
+            guard gain != 1, !objectIDs.isEmpty else { return }
             guard taps.count < MixRenderer.maxSlots else {
                 lastError = "at the \(MixRenderer.maxSlots)-app limit; right-click an app and reset it to free a slot"
-                log.error("tap limit reached, refusing \(key, privacy: .public)")
+                log.error("tap limit reached, refusing \(key.raw, privacy: .public)")
                 return
             }
             guard createTap(key: key, objectIDs: objectIDs) else { return }
-            rebuild()
+            rebuild(reason: "new source \(key.raw)")
             return
         }
         if let slot = order.firstIndex(of: key) {
@@ -70,32 +103,49 @@ final class TapEngine {
         }
     }
 
-    func release(_ key: String) {
-        guard let tap = taps.removeValue(forKey: key) else { return }
-        order.removeAll { $0 == key }
-        gains[key] = 1
-        AudioHardwareDestroyProcessTap(tap.tapID)
-        rebuild()
+    func release(_ key: SourceID) { release([key]) }
+
+    func release(_ keys: [SourceID]) {
+        var removed = false
+        for key in keys {
+            guard let tap = taps.removeValue(forKey: key) else { continue }
+            doomed.append(tap)
+            order.removeAll { $0 == key }
+            gains[key] = 1
+            removed = true
+        }
+        guard removed else { return }
+        log.debug("releasing \(keys.map(\.raw).joined(separator: ","), privacy: .public)")
+        rebuild(reason: "release")
     }
 
     func suspend() {
-        guard ioProcID != nil else { return }
+        guard state == .active else { return }
         teardownIO()
-        isSuspended = true
+        state = .suspended
         log.debug("suspended: IOProc torn down, \(self.order.count) taps kept")
     }
 
     func resume() {
-        guard isSuspended else { return }
-        isSuspended = false
+        guard state == .suspended else { return }
         guard aggregateID != AudioObjectID(kAudioObjectUnknown) else {
-            rebuild()
+            rebuild(reason: "resume")
             return
         }
-        startIO()
+        guard startIO() else {
+            stopGraph()
+            return
+        }
+        state = .active
     }
 
-    func syncObjectIDs(_ objectIDs: [AudioObjectID], for key: String) {
+    func retryIfDue() {
+        guard state.isFailed, let at = retryAt, Date() >= at else { return }
+        retryAt = nil
+        rebuild(reason: "retry \(retryIndex)")
+    }
+
+    func syncObjectIDs(_ objectIDs: [AudioObjectID], for key: SourceID) {
         guard var tap = taps[key], !objectIDs.isEmpty, tap.objectIDs != objectIDs else { return }
         let description = makeDescription(uuid: tap.uuid, objectIDs: objectIDs, key: key)
         var address = propertyAddress(kAudioTapPropertyDescription)
@@ -105,22 +155,22 @@ final class TapEngine {
             AudioObjectSetPropertyData(tap.tapID, &address, 0, nil, size, pointer)
         }
         guard status == noErr else {
-            log.error("tap description update failed for \(key, privacy: .public): \(statusName(status), privacy: .public)")
+            log.error("tap description update failed for \(key.raw, privacy: .public): \(statusName(status), privacy: .public)")
             return
         }
         tap.objectIDs = objectIDs
         taps[key] = tap
-        log.debug("tap \(key, privacy: .public) now covers \(objectIDs.count) process objects")
+        log.debug("tap \(key.raw, privacy: .public) now covers \(objectIDs.count) process objects")
     }
 
-    private func createTap(key: String, objectIDs: [AudioObjectID]) -> Bool {
+    private func createTap(key: SourceID, objectIDs: [AudioObjectID]) -> Bool {
         let uuid = UUID()
         let description = makeDescription(uuid: uuid, objectIDs: objectIDs, key: key)
         var tapID = AudioObjectID(kAudioObjectUnknown)
         let status = AudioHardwareCreateProcessTap(description, &tapID)
-        guard status == noErr else {
+        guard status == noErr, tapID != AudioObjectID(kAudioObjectUnknown) else {
             lastError = "tap creation failed: \(statusName(status))"
-            log.error("tap creation failed for \(key, privacy: .public): \(statusName(status), privacy: .public)")
+            log.error("tap creation failed for \(key.raw, privacy: .public): \(statusName(status), privacy: .public)")
             return false
         }
         taps[key] = Tap(tapID: tapID, uuid: uuid, objectIDs: objectIDs)
@@ -129,42 +179,80 @@ final class TapEngine {
     }
 
     private func makeDescription(
-        uuid: UUID, objectIDs: [AudioObjectID], key: String
+        uuid: UUID, objectIDs: [AudioObjectID], key: SourceID
     ) -> CATapDescription {
         let description = CATapDescription(stereoMixdownOfProcesses: objectIDs)
         description.uuid = uuid
-        description.name = "buried-anchor \(key)"
+        description.name = "buried-anchor \(key.raw)"
         description.isPrivate = true
         description.muteBehavior = .mutedWhenTapped
         description.isProcessRestoreEnabled = true
         return description
     }
 
-    private func rebuild() {
-        isSuspended = false
-        teardownIO()
-        destroyAggregate()
+    private func rebuild(reason: String) {
+        stopGraph()
+        destroyDoomedTaps()
+        retryAt = nil
+
         guard !order.isEmpty else {
-            renderer.setSlotCount(0)
+            renderer.clearSlots()
+            state = .idle
             lastError = nil
+            retryIndex = 0
+            layoutSummary = "-"
             return
         }
-        guard let uid = defaultOutputUID() else {
-            lastError = "no usable output device; passing audio through untouched"
-            renderer.setSlotCount(0)
-            log.error("default output is unusable or is our own aggregate; not rebuilding")
+        guard let device = usableDefaultOutput() else {
+            renderer.clearSlots()
+            fail("no usable output device; audio is passing through untouched")
             return
         }
-        guard createAggregate(outputUID: uid) else { return }
-        renderer.setSlotCount(order.count)
-        for (slot, key) in order.enumerated() {
-            renderer.primeGain(gains[key] ?? 1, slot: slot)
+        guard let aggregate = createAggregate(outputUID: device.uid) else {
+            renderer.clearSlots()
+            return
         }
-        configureRenderer()
-        startIO()
+
+        switch discoverLayout(aggregate: aggregate) {
+        case .failure(let fault):
+            renderer.clearSlots()
+            destroyAggregate(aggregate)
+            fail(fault.message)
+            log.error("layout rejected: \(String(describing: fault), privacy: .public)")
+        case .success(let layout):
+            aggregateID = aggregate
+            order = layout.slots.map(\.key)
+            sampleRate = layout.sampleRate
+            renderer.apply(layout, gains: order.map { gains[$0] ?? 1 })
+            renderer.configure(sampleRate: layout.sampleRate, framesPerBuffer: bufferFrames())
+            guard startIO() else {
+                renderer.clearSlots()
+                stopGraph()
+                return
+            }
+            outputDeviceID = device.id
+            signature = deviceSignature(device.id)
+            layoutSummary = layout.summary
+            installDeviceListeners()
+            state = .active
+            lastError = nil
+            retryIndex = 0
+            log.debug("graph up (\(reason, privacy: .public)): \(layout.summary, privacy: .public)")
+        }
     }
 
-    private func createAggregate(outputUID: String) -> Bool {
+    private func fail(_ message: String) {
+        state = .failed(message)
+        lastError = message
+        signature = .none
+        layoutSummary = "-"
+        let delay = Self.retryDelays[min(retryIndex, Self.retryDelays.count - 1)]
+        retryIndex += 1
+        retryAt = Date().addingTimeInterval(delay)
+        log.error("graph failed: \(message, privacy: .public); retry in \(delay)s")
+    }
+
+    private func createAggregate(outputUID: String) -> AudioObjectID? {
         let tag = UUID().uuidString
         let tapList = order.compactMap { key -> [String: Any]? in
             guard let tap = taps[key] else { return nil }
@@ -185,31 +273,69 @@ final class TapEngine {
         var deviceID = AudioObjectID(kAudioObjectUnknown)
         let status = AudioHardwareCreateAggregateDevice(composition as CFDictionary, &deviceID)
         guard status == noErr, deviceID != AudioObjectID(kAudioObjectUnknown) else {
-            lastError = "aggregate creation failed: \(statusName(status))"
-            log.error("aggregate creation failed: \(statusName(status), privacy: .public)")
-            return false
+            fail("aggregate creation failed: \(statusName(status))")
+            return nil
         }
-        aggregateID = deviceID
-        lastError = nil
-        log.debug("aggregate \(deviceID) built with \(tapList.count) taps on \(outputUID, privacy: .public)")
-        return true
+        return deviceID
     }
 
-    private func configureRenderer() {
-        guard aggregateID != AudioObjectID(kAudioObjectUnknown) else { return }
-        var asbd = AudioStreamBasicDescription()
-        if let first = order.first, let tap = taps[first] {
-            var address = propertyAddress(kAudioTapPropertyFormat)
-            var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-            AudioObjectGetPropertyData(tap.tapID, &address, 0, nil, &size, &asbd)
+    private func discoverLayout(aggregate: AudioObjectID) -> Result<GraphLayout, LayoutFault> {
+        let slotOrder = tapOrder(of: aggregate)
+        var formats: [TapFormat] = []
+        for key in slotOrder {
+            guard let tap = taps[key],
+                  let asbd = tap.tapID.optionalValue(
+                      propertyAddress(kAudioTapPropertyFormat), of: AudioStreamBasicDescription.self
+                  )
+            else { return .failure(.tapNotFloat32) }
+            formats.append(
+                TapFormat(
+                    key: key,
+                    channels: Int(asbd.mChannelsPerFrame),
+                    sampleRate: asbd.mSampleRate,
+                    isFloat32: asbd.isFloat32
+                )
+            )
         }
-        let frames = aggregateID.value(
-            propertyAddress(kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeOutput),
-            default: UInt32(512)
+        return GraphLayout.resolve(
+            taps: formats,
+            input: bufferLayout(aggregate, scope: kAudioObjectPropertyScopeInput),
+            output: bufferLayout(aggregate, scope: kAudioObjectPropertyScopeOutput)
         )
-        renderer.configure(
-            sampleRate: asbd.mSampleRate > 0 ? asbd.mSampleRate : 48000,
-            framesPerBuffer: Int(frames)
+    }
+
+    private func tapOrder(of aggregate: AudioObjectID) -> [SourceID] {
+        let uuids = aggregate.stringArray(propertyAddress(kAudioAggregateDevicePropertyTapList))
+        var byUUID: [String: SourceID] = [:]
+        for (key, tap) in taps { byUUID[tap.uuid.uuidString.uppercased()] = key }
+        let resolved = uuids.compactMap { byUUID[$0.uppercased()] }
+        guard resolved.count == order.count, Set(resolved) == Set(order) else {
+            log.error("aggregate tap list \(uuids.count) does not cover our \(self.order.count) taps; using composition order")
+            return order
+        }
+        if resolved != order {
+            log.debug("aggregate reordered taps; adopting its order")
+        }
+        return resolved
+    }
+
+    private func bufferLayout(
+        _ device: AudioObjectID, scope: AudioObjectPropertyScope
+    ) -> BufferLayout {
+        let channels = device.streamChannelCounts(scope)
+        let formats = device.streams(scope).compactMap(\.virtualFormat)
+        return BufferLayout(
+            bufferChannels: channels,
+            isFloat32: !formats.isEmpty && formats.allSatisfy(\.isFloat32),
+            sampleRate: formats.first?.mSampleRate ?? 0
+        )
+    }
+
+    private func bufferFrames() -> Int {
+        Int(
+            aggregateID.value(
+                propertyAddress(kAudioDevicePropertyBufferFrameSize), default: UInt32(512)
+            )
         )
     }
 
@@ -226,23 +352,31 @@ final class TapEngine {
         return (procID, status)
     }
 
-    private func startIO() {
+    private func startIO() -> Bool {
         let (procID, status) = Self.installIOProc(
             aggregate: aggregateID, queue: ioQueue, renderer: renderer
         )
         guard status == noErr, let procID else {
-            lastError = "IOProc creation failed: \(statusName(status))"
-            log.error("IOProc creation failed: \(statusName(status), privacy: .public)")
-            return
+            fail("IOProc creation failed: \(statusName(status))")
+            return false
         }
-        ioProcID = procID
         let startStatus = AudioDeviceStart(aggregateID, procID)
         guard startStatus == noErr else {
-            lastError = "device start failed: \(statusName(startStatus))"
-            log.error("device start failed: \(statusName(startStatus), privacy: .public)")
-            return
+            check(AudioDeviceDestroyIOProcID(aggregateID, procID), "destroy IOProc after failed start")
+            fail("device start failed: \(statusName(startStatus))")
+            return false
         }
-        log.debug("IOProc started on aggregate \(self.aggregateID)")
+        ioProcID = procID
+        return true
+    }
+
+    private func stopGraph() {
+        deviceListeners.removeAll()
+        teardownIO()
+        destroyAggregate(aggregateID)
+        aggregateID = AudioObjectID(kAudioObjectUnknown)
+        outputDeviceID = AudioObjectID(kAudioObjectUnknown)
+        signature = .none
     }
 
     private func teardownIO() {
@@ -250,22 +384,109 @@ final class TapEngine {
             ioProcID = nil
             return
         }
-        AudioDeviceStop(aggregateID, procID)
-        AudioDeviceDestroyIOProcID(aggregateID, procID)
+        check(AudioDeviceStop(aggregateID, procID), "stop IOProc")
+        check(AudioDeviceDestroyIOProcID(aggregateID, procID), "destroy IOProc")
         ioProcID = nil
     }
 
-    private func destroyAggregate() {
-        guard aggregateID != AudioObjectID(kAudioObjectUnknown) else { return }
-        AudioHardwareDestroyAggregateDevice(aggregateID)
-        aggregateID = AudioObjectID(kAudioObjectUnknown)
+    private func destroyAggregate(_ device: AudioObjectID) {
+        guard device != AudioObjectID(kAudioObjectUnknown) else { return }
+        check(AudioHardwareDestroyAggregateDevice(device), "destroy aggregate")
     }
 
-    private func handleDefaultDeviceChange() {
+    private func destroyDoomedTaps() {
+        guard !doomed.isEmpty else { return }
+        var survivors: [Tap] = []
+        for tap in doomed {
+            let status = AudioHardwareDestroyProcessTap(tap.tapID)
+            if status != noErr {
+                log.error("destroy tap \(tap.tapID) failed: \(statusName(status), privacy: .public)")
+                survivors.append(tap)
+            }
+        }
+        doomed = survivors
+    }
+
+    private func destroy(_ tap: Tap, key: SourceID) {
+        let status = AudioHardwareDestroyProcessTap(tap.tapID)
+        guard status != noErr else { return }
+        log.error("destroy tap for \(key.raw, privacy: .public) failed: \(statusName(status), privacy: .public)")
+    }
+
+    private func check(_ status: OSStatus, _ what: String) {
+        guard status != noErr else { return }
+        log.error("\(what, privacy: .public) failed: \(statusName(status), privacy: .public)")
+    }
+
+    private func installDeviceListeners() {
+        var listeners: [PropertyListener?] = []
+        for (selector, scope) in [
+            (kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeOutput),
+            (kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal),
+            (kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal)
+        ] {
+            listeners.append(
+                PropertyListener(outputDeviceID, propertyAddress(selector, scope), queue: .main) {
+                    [weak self] in
+                    Task { @MainActor in self?.handleRouteChange(fourCC(selector)) }
+                }
+            )
+        }
+        listeners.append(
+            PropertyListener(
+                aggregateID,
+                propertyAddress(kAudioDevicePropertyIOStoppedAbnormally),
+                queue: .main
+            ) { [weak self] in
+                Task { @MainActor in self?.handleAbnormalStop() }
+            }
+        )
+        listeners.append(
+            PropertyListener(
+                aggregateID, propertyAddress(kAudioDevicePropertyBufferFrameSize), queue: .main
+            ) { [weak self] in
+                Task { @MainActor in self?.handleBufferSizeChange() }
+            }
+        )
+        deviceListeners = listeners.compactMap { $0 }
+    }
+
+    private func handleRouteChange(_ reason: String) {
         refreshOutputDeviceName()
         guard !order.isEmpty else { return }
-        log.debug("default output changed, rebuilding")
-        rebuild()
+        if state.isFailed {
+            rebuild(reason: reason)
+            return
+        }
+        let device = defaultOutputDevice()
+        let next = deviceSignature(device)
+        guard device != outputDeviceID || next != signature else { return }
+        log.debug(
+            "route change (\(reason, privacy: .public)): device \(self.outputDeviceID)->\(device), \(self.signature, privacy: .public) -> \(next, privacy: .public)"
+        )
+        rebuild(reason: reason)
+    }
+
+    private func handleAbnormalStop() {
+        guard !order.isEmpty, state == .active else { return }
+        log.error("IO stopped abnormally, rebuilding")
+        rebuild(reason: "abnormal stop")
+    }
+
+    private func handleBufferSizeChange() {
+        guard aggregateID != AudioObjectID(kAudioObjectUnknown) else { return }
+        renderer.configure(sampleRate: sampleRate, framesPerBuffer: bufferFrames())
+    }
+
+    private func deviceSignature(_ device: AudioObjectID) -> DeviceSignature {
+        guard device != AudioObjectID(kAudioObjectUnknown) else { return .none }
+        return DeviceSignature(
+            uid: device.string(propertyAddress(kAudioDevicePropertyDeviceUID)) ?? "",
+            channels: device.streamChannelCounts(kAudioObjectPropertyScopeOutput),
+            sampleRate: device.value(
+                propertyAddress(kAudioDevicePropertyNominalSampleRate), default: Double(0)
+            )
+        )
     }
 
     private func defaultOutputDevice() -> AudioObjectID {
@@ -275,21 +496,78 @@ final class TapEngine {
         )
     }
 
-    private func defaultOutputUID() -> String? {
+    private func usableDefaultOutput() -> (id: AudioObjectID, uid: String)? {
         let device = defaultOutputDevice()
         guard device != AudioObjectID(kAudioObjectUnknown), device != aggregateID else { return nil }
         guard let uid = device.string(propertyAddress(kAudioDevicePropertyDeviceUID)),
               !uid.hasPrefix(Self.aggregateUIDPrefix)
         else { return nil }
-        return uid
+        return (device, uid)
     }
 
     private func refreshOutputDeviceName() {
-        let device = defaultOutputDevice()
-        guard defaultOutputUID() != nil else {
+        guard let device = usableDefaultOutput() else {
             outputDeviceName = "-"
             return
         }
-        outputDeviceName = device.string(propertyAddress(kAudioObjectPropertyName)) ?? "-"
+        outputDeviceName = device.id.string(propertyAddress(kAudioObjectPropertyName)) ?? "-"
+    }
+
+    func diagnostics() -> [String] {
+        var lines: [String] = [
+            "state=\(state)",
+            "output=\(outputDeviceName) id=\(outputDeviceID)",
+            "layout=\(layoutSummary)",
+            "taps=\(order.map(\.raw).joined(separator: ","))"
+        ]
+        for key in order {
+            guard let tap = taps[key] else { continue }
+            let format = tap.tapID.optionalValue(
+                propertyAddress(kAudioTapPropertyFormat), of: AudioStreamBasicDescription.self
+            )
+            lines.append(
+                "tap \(key.raw) id=\(tap.tapID) objects=\(tap.objectIDs.count)"
+                    + " ch=\(format.map { Int($0.mChannelsPerFrame) } ?? -1)"
+                    + " rate=\(format.map { Int($0.mSampleRate) } ?? -1)"
+                    + " float32=\(format?.isFloat32 ?? false)"
+                    + " flags=\(format.map { String($0.mFormatFlags, radix: 2) } ?? "-")"
+            )
+        }
+        guard aggregateID != AudioObjectID(kAudioObjectUnknown) else {
+            lines.append("no aggregate")
+            return lines
+        }
+        lines.append("aggregate=\(aggregateID) bufferFrames=\(bufferFrames())")
+        lines.append(
+            "tapList=\(aggregateID.stringArray(propertyAddress(kAudioAggregateDevicePropertyTapList)))"
+        )
+        lines.append(
+            "subTaps=\(aggregateID.array(propertyAddress(kAudioAggregateDevicePropertySubTapList), of: AudioObjectID.self))"
+        )
+        lines.append(
+            "subDevices=\(aggregateID.array(propertyAddress(kAudioAggregateDevicePropertyActiveSubDeviceList), of: AudioObjectID.self))"
+        )
+        for (label, scope) in [
+            ("input", kAudioObjectPropertyScopeInput), ("output", kAudioObjectPropertyScopeOutput)
+        ] {
+            lines.append("\(label)Buffers=\(aggregateID.streamChannelCounts(scope))")
+            for (index, stream) in aggregateID.streams(scope).enumerated() {
+                let format = stream.virtualFormat
+                let terminal = stream.value(
+                    propertyAddress(kAudioStreamPropertyTerminalType), default: UInt32(0)
+                )
+                let starting = stream.value(
+                    propertyAddress(kAudioStreamPropertyStartingChannel), default: UInt32(0)
+                )
+                lines.append(
+                    "\(label)Stream[\(index)] id=\(stream)"
+                        + " ch=\(format.map { Int($0.mChannelsPerFrame) } ?? -1)"
+                        + " rate=\(format.map { Int($0.mSampleRate) } ?? -1)"
+                        + " float32=\(format?.isFloat32 ?? false)"
+                        + " terminal=\(fourCC(terminal)) startingChannel=\(starting)"
+                )
+            }
+        }
+        return lines
     }
 }

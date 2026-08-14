@@ -5,15 +5,24 @@ import Synchronization
 
 final class MixRenderer: @unchecked Sendable {
     static let maxSlots = 32
+    static let maxTapChannels = 2
+    static let maxOutputChannels = 64
     static let rampSeconds: Float = 0.03
     static let softClipKnee: Float = 0.7
 
     private let targets: UnsafeMutablePointer<Atomic<Float>>
     private let current: UnsafeMutablePointer<Atomic<Float>>
     private let slotPeak: UnsafeMutablePointer<Atomic<Float>>
+    private let slotInputBuffer: UnsafeMutablePointer<Int32>
+    private let slotChannels: UnsafeMutablePointer<Int32>
+    private let slotTargets: UnsafeMutablePointer<Int32>
+    private let outputBuffer: UnsafeMutablePointer<Int32>
+    private let outputOffset: UnsafeMutablePointer<Int32>
+    private let outputStride: UnsafeMutablePointer<Int32>
     private let outputPeak = Atomic<Float>(0)
     private let clipCount = Atomic<Int32>(0)
     private let activeSlots = Atomic<Int32>(0)
+    private let outputChannelCount = Atomic<Int32>(0)
     private let softClip = Atomic<Bool>(false)
     private let coefficient = Atomic<Float>(0.3)
 
@@ -21,11 +30,23 @@ final class MixRenderer: @unchecked Sendable {
         targets = .allocate(capacity: Self.maxSlots)
         current = .allocate(capacity: Self.maxSlots)
         slotPeak = .allocate(capacity: Self.maxSlots)
+        slotInputBuffer = .allocate(capacity: Self.maxSlots)
+        slotChannels = .allocate(capacity: Self.maxSlots)
+        slotTargets = .allocate(capacity: Self.maxSlots * Self.maxTapChannels)
+        outputBuffer = .allocate(capacity: Self.maxOutputChannels)
+        outputOffset = .allocate(capacity: Self.maxOutputChannels)
+        outputStride = .allocate(capacity: Self.maxOutputChannels)
         for slot in 0..<Self.maxSlots {
             (targets + slot).initialize(to: Atomic(1))
             (current + slot).initialize(to: Atomic(1))
             (slotPeak + slot).initialize(to: Atomic(0))
         }
+        slotInputBuffer.initialize(repeating: -1, count: Self.maxSlots)
+        slotChannels.initialize(repeating: 0, count: Self.maxSlots)
+        slotTargets.initialize(repeating: -1, count: Self.maxSlots * Self.maxTapChannels)
+        outputBuffer.initialize(repeating: -1, count: Self.maxOutputChannels)
+        outputOffset.initialize(repeating: 0, count: Self.maxOutputChannels)
+        outputStride.initialize(repeating: 1, count: Self.maxOutputChannels)
     }
 
     deinit {
@@ -35,6 +56,12 @@ final class MixRenderer: @unchecked Sendable {
         targets.deallocate()
         current.deallocate()
         slotPeak.deallocate()
+        slotInputBuffer.deallocate()
+        slotChannels.deallocate()
+        slotTargets.deallocate()
+        outputBuffer.deallocate()
+        outputOffset.deallocate()
+        outputStride.deallocate()
     }
 
     func configure(sampleRate: Double, framesPerBuffer: Int) {
@@ -43,19 +70,41 @@ final class MixRenderer: @unchecked Sendable {
         coefficient.store(1 - exp(-bufferSeconds / Self.rampSeconds), ordering: .relaxed)
     }
 
-    func setSlotCount(_ count: Int) {
-        activeSlots.store(Int32(min(count, Self.maxSlots)), ordering: .relaxed)
+    func apply(_ layout: GraphLayout, gains: [Float]) {
+        activeSlots.store(0, ordering: .releasing)
+        let slots = min(layout.slots.count, Self.maxSlots)
+        for slot in 0..<slots {
+            let source = layout.slots[slot]
+            slotInputBuffer[slot] = Int32(source.inputBuffer)
+            slotChannels[slot] = Int32(source.channels)
+            for channel in 0..<Self.maxTapChannels {
+                let target = channel < source.targets.count ? source.targets[channel] : -1
+                slotTargets[slot * Self.maxTapChannels + channel] = Int32(target)
+            }
+            let gain = slot < gains.count ? gains[slot] : 1
+            targets[slot].store(gain, ordering: .relaxed)
+            current[slot].store(gain, ordering: .relaxed)
+            slotPeak[slot].store(0, ordering: .relaxed)
+        }
+        let channels = min(layout.outputChannels.count, Self.maxOutputChannels)
+        for channel in 0..<channels {
+            let target = layout.outputChannels[channel]
+            outputBuffer[channel] = Int32(target.buffer)
+            outputOffset[channel] = Int32(target.offset)
+            outputStride[channel] = Int32(max(target.stride, 1))
+        }
+        outputChannelCount.store(Int32(channels), ordering: .relaxed)
+        activeSlots.store(Int32(slots), ordering: .releasing)
+    }
+
+    func clearSlots() {
+        activeSlots.store(0, ordering: .releasing)
+        outputChannelCount.store(0, ordering: .relaxed)
     }
 
     func setGain(_ gain: Float, slot: Int) {
         guard slot >= 0, slot < Self.maxSlots else { return }
         targets[slot].store(gain, ordering: .relaxed)
-    }
-
-    func primeGain(_ gain: Float, slot: Int) {
-        guard slot >= 0, slot < Self.maxSlots else { return }
-        targets[slot].store(gain, ordering: .relaxed)
-        current[slot].store(gain, ordering: .relaxed)
     }
 
     func setSoftClip(_ enabled: Bool) {
@@ -79,48 +128,88 @@ final class MixRenderer: @unchecked Sendable {
         input: UnsafePointer<AudioBufferList>,
         output: UnsafeMutablePointer<AudioBufferList>
     ) {
-        let inputs = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         let outputs = UnsafeMutableAudioBufferListPointer(output)
-        guard let outBuffer = outputs.first,
-              let destination = outBuffer.mData?.assumingMemoryBound(to: Float.self)
-        else { return }
+        var frameLimit = Int.max
+        for index in 0..<outputs.count {
+            let buffer = outputs[index]
+            guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
+            let samples = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+            guard samples > 0 else { continue }
+            vDSP_vclr(data, 1, vDSP_Length(samples))
+            frameLimit = min(frameLimit, samples / Int(max(buffer.mNumberChannels, 1)))
+        }
+        guard frameLimit > 0, frameLimit != Int.max else { return }
 
-        let outCount = vDSP_Length(Int(outBuffer.mDataByteSize) / MemoryLayout<Float>.size)
-        guard outCount > 0 else { return }
-        vDSP_vclr(destination, 1, outCount)
+        let slots = Int(activeSlots.load(ordering: .acquiring))
+        let channelCount = Int(outputChannelCount.load(ordering: .relaxed))
+        guard slots > 0, channelCount > 0 else { return }
 
+        let inputs = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         let ramp = coefficient.load(ordering: .relaxed)
-        let slots = min(Int(activeSlots.load(ordering: .relaxed)), min(inputs.count, Self.maxSlots))
+
         for slot in 0..<slots {
-            guard let source = inputs[slot].mData?.assumingMemoryBound(to: Float.self) else { continue }
-            let available = vDSP_Length(Int(inputs[slot].mDataByteSize) / MemoryLayout<Float>.size)
-            let count = min(available, outCount)
-            guard count > 0 else { continue }
+            let index = Int(slotInputBuffer[slot])
+            guard index >= 0, index < inputs.count else { continue }
+            let buffer = inputs[index]
+            let channels = Int(slotChannels[slot])
+            guard channels > 0, channels <= Self.maxTapChannels,
+                  Int(buffer.mNumberChannels) == channels,
+                  let source = buffer.mData?.assumingMemoryBound(to: Float.self)
+            else { continue }
+
+            let available = Int(buffer.mDataByteSize) / (MemoryLayout<Float>.size * channels)
+            let frames = min(available, frameLimit)
+            guard frames > 0 else { continue }
 
             let from = current[slot].load(ordering: .relaxed)
             let to = from + (targets[slot].load(ordering: .relaxed) - from) * ramp
-            var start = from
-            var step = (to - from) / Float(count)
-            vDSP_vrampmuladd(source, 1, &start, &step, destination, 1, count)
-            current[slot].store(to, ordering: .relaxed)
-
+            let increment = (to - from) / Float(frames)
             var peak: Float = 0
-            vDSP_maxmgv(source, 1, &peak, count)
+
+            for channel in 0..<channels {
+                let target = Int(slotTargets[slot * Self.maxTapChannels + channel])
+                guard target >= 0, target < channelCount else { continue }
+                let destination = Int(outputBuffer[target])
+                guard destination >= 0, destination < outputs.count,
+                      let base = outputs[destination].mData?.assumingMemoryBound(to: Float.self)
+                else { continue }
+                var start = from
+                var step = increment
+                vDSP_vrampmuladd(
+                    source + channel, vDSP_Stride(channels),
+                    &start, &step,
+                    base + Int(outputOffset[target]), vDSP_Stride(outputStride[target]),
+                    vDSP_Length(frames)
+                )
+                var channelPeak: Float = 0
+                vDSP_maxmgv(source + channel, vDSP_Stride(channels), &channelPeak, vDSP_Length(frames))
+                peak = max(peak, channelPeak)
+            }
+
+            current[slot].store(to, ordering: .relaxed)
             raiseMax(slotPeak[slot], to: peak * max(from, to))
         }
 
-        var peak: Float = 0
-        vDSP_maxmgv(destination, 1, &peak, outCount)
-        raiseMax(outputPeak, to: peak)
-        if peak > 1 { clipCount.wrappingAdd(1, ordering: .relaxed) }
-
-        if softClip.load(ordering: .relaxed) {
-            Self.shape(destination, count: Int(outCount))
-        } else {
-            var low: Float = -1
-            var high: Float = 1
-            vDSP_vclip(destination, 1, &low, &high, destination, 1, outCount)
+        var loudest: Float = 0
+        let shaping = softClip.load(ordering: .relaxed)
+        for index in 0..<outputs.count {
+            let buffer = outputs[index]
+            guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
+            let samples = vDSP_Length(Int(buffer.mDataByteSize) / MemoryLayout<Float>.size)
+            guard samples > 0 else { continue }
+            var peak: Float = 0
+            vDSP_maxmgv(data, 1, &peak, samples)
+            loudest = max(loudest, peak)
+            if shaping {
+                Self.shape(data, count: Int(samples))
+            } else {
+                var low: Float = -1
+                var high: Float = 1
+                vDSP_vclip(data, 1, &low, &high, data, 1, samples)
+            }
         }
+        raiseMax(outputPeak, to: loudest)
+        if loudest > 1 { clipCount.wrappingAdd(1, ordering: .relaxed) }
     }
 
     private func raiseMax(_ cell: borrowing Atomic<Float>, to value: Float) {

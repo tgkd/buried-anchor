@@ -43,41 +43,81 @@ and must be launched through `open`:
 
 ```
 make run                                                    # or make prod
+.build/BuriedAnchor.app/Contents/MacOS/BuriedAnchor --render   # the one exception, see below
+open -a "$PWD/.build/BuriedAnchor.app" --args --layout PlayerA
 open -a "$PWD/.build/BuriedAnchor.app" --args --selftest afplay 150 [--switch]
-open -a "$PWD/.build/BuriedAnchor.app" --args --multi tonePlayerA 50 tonePlayerB 150
+open -a "$PWD/.build/BuriedAnchor.app" --args --multi PlayerA 50 PlayerB 150
 open -a "$PWD/.build/BuriedAnchor.app" --args --suspend afplay
 open -a "$PWD/.build/BuriedAnchor.app" --args --watch 30
 open -a "$PWD/.build/BuriedAnchor.app" --args --loginitem
 ```
 
-Output goes to `/tmp/buriedanchor-selftest.log` (appended) and to `make logs`. `--selftest` matches
-one playing row by substring, boosts/mutes it and optionally switches the default output device
-mid-playback; `--multi` needs **two distinct process names** — two instances of one binary collapse
-into a single row by design, so make renamed ad-hoc-signed copies of `afplay` as the README shows.
-`--watch` just dumps the row list every 3 s, which is how row-grouping/linger behavior gets checked.
-`--loginitem` registers and unregisters the login item, printing `SMAppService.mainApp.status` at
-each step; it leaves the registration alone if it was already enabled before the run.
+Output goes to `/tmp/buriedanchor-selftest.log` (appended) and to `make logs`. Every mode ends with
+`RESULT pass` or `RESULT fail (n)` and exits with a matching status, and every mode restores the
+percentage it found on the row it touched — including removing the key again when there was none.
+
+`--render` is the only mode that runs the **inner binary directly**, and the only one that may: it
+touches no HAL object, asks for no system-audio access, and needs no audio playing, so the
+responsible-process rule below does not apply and you get a real exit code. It covers
+`GraphLayout.resolve` (duplex offset, non-interleaved, multichannel, mono fold, rejected formats)
+and `MixRenderer.render` against synthetic `AudioBufferList`s. Run it after any change to
+`Render.swift` or `GraphLayout.swift`.
+
+`--layout <match>` dumps what the live aggregate actually looks like — tap list, sub-taps, per-stream
+virtual formats, buffer shapes, terminal types. That dump is the evidence to look at first when
+audio comes out wrong on unfamiliar hardware; do not assume every machine matches the built-in
+speakers. `--selftest` matches one playing row by substring, boosts/mutes it and optionally switches
+the default output device mid-playback; `--multi` needs **two distinct rows**, and row identity
+follows the owning app up the parent chain, so an `afplay` started from a terminal groups under the
+*terminal* — wrap each player in its own throwaway `.app` bundle as the README shows. `--watch`
+dumps the row list every 3 s (`*` playing, `!` rendering, `?` tapped but idle), which is how
+row-grouping, linger and suspend-on-exit behavior get checked. `--loginitem` registers and
+unregisters the login item, printing `SMAppService.mainApp.status` at each step; it leaves the
+registration alone if it was already enabled before the run.
+
+Debug-level `log.debug` lines never reach `log show` after the process exits — capture them live
+with `make logs` (or `log stream`) running alongside the test, which is the only way to see
+`graph up`, `suspended`, `route change` and eviction lines.
 
 ## Architecture
 
 `MixerModel` (`@MainActor @Observable`) is the only thing the SwiftUI layer touches. It owns a
 `ProcessRegistry` (what apps exist) and a `TapEngine` (what audio actually happens), and drives both
-from a single 100 ms timer: every tick refreshes meters, every 10th tick re-snapshots the process
-list. Property listeners on `kAudioHardwarePropertyProcessObjectList` and
-`kAudioHardwarePropertyDefaultOutputDevice` supplement the poll.
+from a single 100 ms timer: every tick refreshes meters, drives suspension and services the engine's
+retry backoff; every 10th tick re-snapshots the process list. That poll is a backstop, not the
+primary signal — property listeners on `kAudioHardwarePropertyProcessObjectList`, on
+`kAudioProcessPropertyIsRunningOutput` for *every* discovered process object, and on
+`kAudioHardwarePropertyDefaultOutputDevice` drive reconciliation, coalesced through
+`scheduleReconcile` so a burst of listener fires costs one `refreshList`.
 
 **One aggregate, N taps** — not one aggregate per app. `TapEngine` keeps one `CATapDescription` per
 controlled *app* (`.mutedWhenTapped`, private, `processRestoreEnabled`) and puts them all in a single
 private aggregate device built around the current default output, with one IOProc.
 
-The load-bearing invariant is the slot mapping:
+The load-bearing invariant is still the slot mapping, but it is now **discovered and validated**
+rather than assumed (`GraphLayout.swift`). After the aggregate comes up, `TapEngine.discoverLayout`:
 
-```
-TapEngine.order[i]  ==  kAudioAggregateDeviceTapListKey[i]  ==  input buffer i  ==  renderer slot i
-```
+1. reads `kAudioAggregateDevicePropertyTapList` and reorders `order` to match it, instead of
+   trusting that the HAL kept composition order;
+2. reads the aggregate's input buffer shape and finds where the taps sit in it by matching channel
+   counts, so a duplex sub-device's own input streams cannot be rendered as an app's audio
+   (`inputOffset`) — pick the tail-most alignment, since taps are appended after sub-devices;
+3. maps every output channel to an explicit `(buffer, offset, stride)`, which is what makes
+   non-interleaved and multichannel outputs correct;
+4. rejects anything it cannot map — not 32-bit float, no output channels, taps that don't line up,
+   disagreeing tap sample rates — and the engine then holds a `.failed` state and passes audio
+   through untouched rather than rendering garbage.
 
-That positional identity is the only thing connecting a buffer back to an app. Anything that
-reorders `order` without rebuilding the aggregate silently crosses apps' audio.
+`GraphLayout.resolve` is a pure function over `[TapFormat]`, input `BufferLayout` and output
+`BufferLayout`, which is what makes `--render` able to test all of this without hardware.
+`MixerModel.refreshMeters` still indexes slots by position in `engine.controlledKeys`, so that array
+must stay equal to the renderer's slot order — `rebuild` maintains it from the resolved layout.
+
+`TapEngine.state` is `idle | active | suspended | failed(String)`. `isControlled` means "we hold a
+tap for this app" (drives the reset menu item and the row's saved volume); `isActive` means "the app
+is actually being rendered right now" (drives the meter). Do not collapse them again: a tap can
+exist while the graph is failed, and reporting that as control is what made a transient HAL failure
+look permanent.
 
 Two cost tiers, and the difference matters:
 
@@ -87,34 +127,75 @@ Two cost tiers, and the difference matters:
   aggregate, and recomputes every slot — briefly interrupting all other controlled apps. Same path
   runs on a default-output-device change.
 
-An app is untapped and bit-transparent until its slider first leaves 100%, then keeps its tap for
-the session. `MixRenderer.maxSlots` (32) caps controlled apps.
+`rebuild` is the only place that mutates the graph, and it does so in dependency order: stop IO →
+destroy IOProc → destroy aggregate → destroy taps queued in `doomed` → create aggregate → validate
+layout → prime gains → start IO → publish `.active`. `release` never destroys a tap inline; it moves
+it to `doomed` so it dies only after the aggregate that contains it is gone. Every HAL lifecycle call
+is status-checked through `check(_:_:)`, and a tap that refuses to die stays in `doomed` for the next
+attempt rather than being forgotten. On any failure the engine cleans up what it created, enters
+`.failed`, and retries on a 1/2/5/15/30 s backoff (`retryIfDue`, driven from the model tick) or on
+the next relevant HAL event.
 
-**Suspension** is the third tier. When every controlled app sits at exactly 100%, `MixerModel`
-counts 15 ticks (1.5 s) and calls `engine.suspend()`, which tears down the IOProc but keeps the taps
-and the aggregate. `.mutedWhenTapped` only mutes while a running IOProc consumes the tap, so this
-hands every app back its own bit-transparent output and makes macOS drop the purple system-audio
-indicator — verified with `--suspend`. Resume is `startIO()` on the surviving aggregate, so slot
-mapping and gains are untouched; any gain leaving 1.0 resumes immediately, before the next tick.
-This is why percentages are rounded in `setPercent` and on load: a slider left at 100.19% reads as
-"100%" but is not `gain == 1`, so it would hold a tap and keep the indicator lit forever.
+Besides the default-output-device listener, the engine watches the *current* output device's stream
+configuration, nominal sample rate and is-alive, plus the aggregate's `IOStoppedAbnormally` and
+buffer frame size. Route changes are gated on a `DeviceSignature` (uid + output channels + rate)
+so a notification that carries no actual change cannot cause a rebuild — an unnecessary rebuild is
+an audible glitch for every controlled app. Buffer-size changes only reconfigure the ramp.
 
-`MixerModel.reset(_:)` is the *only* caller of `engine.release`, so it is the only path back out of
-the graph and the only way to free a slot. It is reached from the row's right-click menu — not from
-the slider, and deliberately not from returning the slider to 100%, since that would rebuild the
-aggregate whenever the slider crossed 100. Don't remove it without providing another release path.
-Mute is a plain `setPercent(0,)` with the pre-mute level stashed in `premute`; it keeps the tap.
+An app is untapped and bit-transparent until its slider first leaves 100%, or until it appears while
+carrying a saved non-unity volume — `MixerModel.refreshList` prepares the tap as soon as the app has
+audio process objects, so playback does not start at the wrong level while a 1 s poll catches up.
+Per-process `kAudioProcessPropertyIsRunningOutput` listeners (coalesced through
+`scheduleReconcile`) drive that, with the poll left as a backstop.
+
+`MixRenderer.maxSlots` (32) caps controlled apps, and slots are now reclaimed: a tap whose app has
+had no process objects for 5 minutes is released, but `sweepRetention` defers that until the engine
+is suspended or nothing controlled is playing, so reclaiming never interrupts audio. At the cap,
+`claimSlot` evicts the least-recently-active non-playing source. Releasing a tap never touches the
+saved percentage.
+
+**Suspension** is the third tier. When every controlled app sits at exactly 100% — *or* when none of
+the controlled apps has any audio process object left — `MixerModel` waits 1.5 s (wall clock, since
+listener-driven reconciles make tick counting irregular) and calls `engine.suspend()`, which tears
+down the IOProc but keeps the taps and the aggregate. `.mutedWhenTapped` only mutes while a running
+IOProc consumes the tap, so this hands every app back its own bit-transparent output and makes macOS
+drop the purple system-audio indicator — verified with `--suspend`. Resume is `startIO()` on the
+surviving aggregate, so slot mapping and gains are untouched; any gain leaving 1.0 resumes
+immediately, before the next tick. This is why percentages are rounded in `setPercent` and on load:
+a slider left at 100.19% reads as "100%" but is not `gain == 1`, so it would hold a tap and keep the
+indicator lit forever.
+
+Suspension deliberately does **not** trigger for an app that is present but merely silent, even
+though that would save more power. A suspended graph is a pass-through graph, so the first buffers
+after an app starts playing again would escape at full volume before `startIO` completes — for a
+muted app that is an audible burst. Absence is safe (a process that does not exist cannot make
+noise); silence is not. Do not "fix" this without measuring that resume latency first.
+
+`MixerModel.reset(_:)` — the row's right-click menu — is the user-facing path back out of the graph:
+it drops the saved percentage *and* releases the tap. It is deliberately not reachable from the
+slider returning to 100%, since that would rebuild the aggregate whenever the slider crossed 100.
+The other two callers of `engine.release` are `sweepRetention` and `claimSlot`, and both keep the
+saved percentage — only `reset` forgets it. Mute is a plain `setPercent(0,)` with the pre-mute level
+stashed in `premute`; it keeps the tap.
 
 ### Realtime callback (`Render.swift`)
 
 `MixRenderer.render` runs on the Core Audio IO thread: **no allocation, no locks, no logging, no
 Foundation**. Gains cross the thread boundary only through `Atomic<Float>`; meters and clip counts
-come back the same way via `exchange(0)`. It clears the single output buffer, then for each slot does
-gain-and-sum in one pass with `vDSP_vrampmuladd`, ramping toward the target over ~30 ms so slider
-moves don't zipper. Output is hard-clipped with `vDSP_vclip` unless the soft-clip toggle switches to
-`tanh` shaping above a 0.7 knee.
+come back the same way via `exchange(0)`. The slot and output-channel maps are plain preallocated
+`Int32` buffers written by `apply` only while IO is stopped, published by storing `activeSlots` with
+release ordering and read with acquire ordering — that pairing is what makes the map safe to read
+without a lock.
 
-### Row identity (`ProcessRegistry.swift`)
+It clears **every** output buffer (not just the first — anything left unwritten is stale device
+memory, which on a non-interleaved device is the entire right channel), then for each slot walks its
+tap channels and does gain-and-sum in one strided `vDSP_vrampmuladd` per channel into the mapped
+output channel, ramping toward the target over ~30 ms so slider moves don't zipper. Every slot
+re-checks `mNumberChannels` against the map before touching memory and skips the slot on a mismatch.
+Output is hard-clipped with `vDSP_vclip` unless the soft-clip toggle switches to `tanh` shaping above
+a 0.7 knee.
+
+### Row identity (`SourceID.swift`, `ProcessRegistry.swift`)
 
 Raw process objects are mostly invisible daemons, bundle IDs are sometimes nil and sometimes shared
 across processes, and the user-visible app is often absent from the list entirely (Slack appears only
@@ -124,8 +205,14 @@ by walking the parent PID chain via `sysctl` for a `.regular` (else `.accessory`
 `IsRunningOutput` are dropped — that is what removes the daemon noise. The PID→owner cache is keyed
 on process start time so PID reuse cannot alias.
 
-Row keys are also the `UserDefaults` keys under `appVolumePercents` and `appVolumePremute`, so
-changing the keying scheme silently orphans saved volumes.
+Those four cases are now the `SourceID` enum (`bundle` / `executable` / `ephemeral`), whose `raw`
+string is byte-identical to the old key strings, so existing saved volumes keep working. Only
+`isDurable` identities (bundle, executable) are ever written to `UserDefaults` — a `pid:<n>` key
+cannot survive the process it names, so persisting it only accumulated garbage. Values are clamped
+to 0–150 and dropped if non-finite on load, and the normalized dictionary is written back once.
+
+Row keys are still the `UserDefaults` keys under `appVolumePercents` and `appVolumePremute`, so
+changing `SourceID.raw` silently orphans saved volumes.
 
 ### Settings (`Settings.swift`)
 
