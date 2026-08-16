@@ -99,6 +99,8 @@ extension AudioStreamBasicDescription {
     }
 }
 
+let halNotifyQueue = DispatchQueue(label: "com.buriedanchor.halnotify")
+
 final class PropertyListener {
     private let objectID: AudioObjectID
     private var address: AudioObjectPropertyAddress
@@ -109,7 +111,7 @@ final class PropertyListener {
     init?(
         _ objectID: AudioObjectID,
         _ address: AudioObjectPropertyAddress,
-        queue: DispatchQueue,
+        queue: DispatchQueue = halNotifyQueue,
         handler: @escaping @Sendable () -> Void
     ) {
         self.objectID = objectID

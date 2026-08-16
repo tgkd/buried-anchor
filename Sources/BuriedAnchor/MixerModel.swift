@@ -81,8 +81,7 @@ final class MixerModel {
         outputDeviceName = engine.outputDeviceName
         processListListener = PropertyListener(
             systemObject,
-            propertyAddress(kAudioHardwarePropertyProcessObjectList),
-            queue: .main
+            propertyAddress(kAudioHardwarePropertyProcessObjectList)
         ) { [weak self] in
             Task { @MainActor in self?.scheduleReconcile() }
         }
@@ -263,8 +262,7 @@ final class MixerModel {
         for objectID in objectIDs where activityListeners[objectID] == nil {
             activityListeners[objectID] = PropertyListener(
                 objectID,
-                propertyAddress(kAudioProcessPropertyIsRunningOutput),
-                queue: .main
+                propertyAddress(kAudioProcessPropertyIsRunningOutput)
             ) { [weak self] in
                 Task { @MainActor in self?.scheduleReconcile() }
             }

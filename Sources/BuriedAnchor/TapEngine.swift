@@ -61,8 +61,7 @@ final class TapEngine {
     func start() {
         defaultDeviceListener = PropertyListener(
             systemObject,
-            propertyAddress(kAudioHardwarePropertyDefaultOutputDevice),
-            queue: .main
+            propertyAddress(kAudioHardwarePropertyDefaultOutputDevice)
         ) { [weak self] in
             Task { @MainActor in self?.handleRouteChange("default output device") }
         }
@@ -426,7 +425,7 @@ final class TapEngine {
             (kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal)
         ] {
             listeners.append(
-                PropertyListener(outputDeviceID, propertyAddress(selector, scope), queue: .main) {
+                PropertyListener(outputDeviceID, propertyAddress(selector, scope)) {
                     [weak self] in
                     Task { @MainActor in self?.handleRouteChange(fourCC(selector)) }
                 }
@@ -435,15 +434,14 @@ final class TapEngine {
         listeners.append(
             PropertyListener(
                 aggregateID,
-                propertyAddress(kAudioDevicePropertyIOStoppedAbnormally),
-                queue: .main
+                propertyAddress(kAudioDevicePropertyIOStoppedAbnormally)
             ) { [weak self] in
                 Task { @MainActor in self?.handleAbnormalStop() }
             }
         )
         listeners.append(
             PropertyListener(
-                aggregateID, propertyAddress(kAudioDevicePropertyBufferFrameSize), queue: .main
+                aggregateID, propertyAddress(kAudioDevicePropertyBufferFrameSize)
             ) { [weak self] in
                 Task { @MainActor in self?.handleBufferSizeChange() }
             }
