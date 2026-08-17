@@ -48,6 +48,7 @@ open -a "$PWD/.build/BuriedAnchor.app" --args --layout PlayerA
 open -a "$PWD/.build/BuriedAnchor.app" --args --selftest afplay 150 [--switch]
 open -a "$PWD/.build/BuriedAnchor.app" --args --multi PlayerA 50 PlayerB 150
 open -a "$PWD/.build/BuriedAnchor.app" --args --suspend afplay
+open -a "$PWD/.build/BuriedAnchor.app" --args --capture PlayerA
 open -a "$PWD/.build/BuriedAnchor.app" --args --watch 30
 open -a "$PWD/.build/BuriedAnchor.app" --args --loginitem
 ```
@@ -71,9 +72,17 @@ the default output device mid-playback; `--multi` needs **two distinct rows**, a
 follows the owning app up the parent chain, so an `afplay` started from a terminal groups under the
 *terminal* — wrap each player in its own throwaway `.app` bundle as the README shows. `--watch`
 dumps the row list every 3 s (`*` playing, `!` rendering, `?` tapped but idle), which is how
-row-grouping, linger and suspend-on-exit behavior get checked. `--loginitem` registers and
-unregisters the login item, printing `SMAppService.mainApp.status` at each step; it leaves the
-registration alone if it was already enabled before the run.
+row-grouping, linger and suspend-on-exit behavior get checked. `--capture` walks one playing row
+through 150% → 0% → 150% → 100% and asserts on our own process object's
+`kAudioProcessPropertyIsRunningOutput` at each step, which is how "do we hold the output device"
+gets checked. `--loginitem` registers and unregisters the login item, printing
+`SMAppService.mainApp.status` at each step; it leaves the registration alone if it was already
+enabled before the run.
+
+Every mode that matches a playing row needs that row to keep playing for the *whole* run —
+`--capture` takes about 20 s. A source that ends mid-run does not fail loudly, it just makes every
+later step measure silence, so start a long tone fresh immediately before the run rather than
+reusing one already in flight.
 
 Debug-level `log.debug` lines never reach `log show` after the process exits — capture them live
 with `make logs` (or `log stream`) running alongside the test, which is the only way to see
@@ -127,6 +136,11 @@ Two cost tiers, and the difference matters:
   aggregate, and recomputes every slot — briefly interrupting all other controlled apps. Same path
   runs on a default-output-device change.
 
+`reconcile(reason:)` is the only place that decides what the graph should be — no aggregate, an
+aggregate with the IOProc stopped, or a running one — and it also republishes tap mute behaviors on
+every transition. It delegates to `rebuild` whenever the slot map itself changes (a tap added or
+released, a route change, a retry).
+
 `rebuild` is the only place that mutates the graph, and it does so in dependency order: stop IO →
 destroy IOProc → destroy aggregate → destroy taps queued in `doomed` → create aggregate → validate
 layout → prime gains → start IO → publish `.active`. `release` never destroys a tap inline; it moves
@@ -154,22 +168,39 @@ is suspended or nothing controlled is playing, so reclaiming never interrupts au
 `claimSlot` evicts the least-recently-active non-playing source. Releasing a tap never touches the
 saved percentage.
 
-**Suspension** is the third tier. When every controlled app sits at exactly 100% — *or* when none of
-the controlled apps has any audio process object left — `MixerModel` waits 1.5 s (wall clock, since
-listener-driven reconciles make tick counting irregular) and calls `engine.suspend()`, which tears
-down the IOProc but keeps the taps and the aggregate. `.mutedWhenTapped` only mutes while a running
-IOProc consumes the tap, so this hands every app back its own bit-transparent output and makes macOS
-drop the purple system-audio indicator — verified with `--suspend`. Resume is `startIO()` on the
-surviving aggregate, so slot mapping and gains are untouched; any gain leaving 1.0 resumes
-immediately, before the next tick. This is why percentages are rounded in `setPercent` and on load:
-a slider left at 100.19% reads as "100%" but is not `gain == 1`, so it would hold a tap and keep the
-indicator lit forever.
+**Suspension** is the third tier, and it is what keeps us from holding the output device open.
+Two things move independently, decided in one place — `TapEngine.reconcile`:
 
-Suspension deliberately does **not** trigger for an app that is present but merely silent, even
-though that would save more power. A suspended graph is a pass-through graph, so the first buffers
-after an app starts playing again would escape at full volume before `startIO` completes — for a
-muted app that is an audible burst. Absence is safe (a process that does not exist cannot make
-noise); silence is not. Do not "fix" this without measuring that resume latency first.
+- **The aggregate** exists whenever any controlled gain is not exactly 1 (`needsGraph`). Keeping it
+  is free: an aggregate with no running IOProc does **not** make the HAL report us as running
+  output and does not keep the device running — measured with `--capture`. So resume stays a cheap
+  `startIO()` rather than a rebuild.
+- **The IOProc** runs only while some controlled app whose gain is neither 0 nor 1 is *actually
+  playing*. `MixerModel.updateSuspension` waits 1.5 s (wall clock, since listener-driven reconciles
+  make tick counting irregular) before tearing it down, and resumes the moment such an app starts
+  playing again.
+
+Whenever the IOProc is down, every tap whose gain is not 1 is switched from `.mutedWhenTapped` to
+`.muted` (`applyMuteBehaviors`, written through `kAudioTapPropertyDescription` on the live tap, the
+same way `syncObjectIDs` rewrites the process list). `CATapMuted` silences the process for as long as
+the tap exists, with no reading client — which is what lets the engine stop rendering while an app is
+merely silent. Without it a suspended graph is a pass-through graph and the first buffers after
+playback resumes escape at full volume, which for a muted app is an audible burst. A tap at exactly
+gain 1 keeps `.mutedWhenTapped`, which with no IOProc means bit-transparent pass-through.
+
+Why this matters far beyond power: a running IOProc makes the HAL report **our own process** as
+`kAudioProcessPropertyIsRunningOutput`, and that is the signal macOS arbitrates AirPods automatic
+switching on. Holding it permanently drags AirPods off an iPhone onto the Mac and never hands them
+back. A row muted at 0% used to pin the graph forever, since 0 is not 1 — the reported bug this
+design replaced. `--capture` is the regression test: it asserts we report `IsRunningOutput` while
+rendering and stop reporting it at 0% and at 100%.
+
+Percentages are rounded in `setPercent` and on load for the same reason: a slider left at 100.19%
+reads as "100%" but is not `gain == 1`, so it would hold a tap and an aggregate forever.
+
+Whether a `.muted` tap is *audibly* silent cannot be verified from inside the process — see PLAN.md
+❌6b, a global tap is taken before per-process muting and reads the same level in every state. That
+one property is checked by ear.
 
 `MixerModel.reset(_:)` — the row's right-click menu — is the user-facing path back out of the graph:
 it drops the saved percentage *and* releases the tap. It is deliberately not reachable from the

@@ -17,6 +17,7 @@ final class TapEngine {
         let tapID: AudioObjectID
         let uuid: UUID
         var objectIDs: [AudioObjectID]
+        var behavior: CATapMuteBehavior
     }
 
     private struct DeviceSignature: Equatable, CustomStringConvertible {
@@ -48,6 +49,7 @@ final class TapEngine {
     private var deviceListeners: [PropertyListener] = []
     private var retryIndex = 0
     private var retryAt: Date?
+    private var wantsIO = false
 
     private(set) var state: State = .idle
     private(set) var lastError: String?
@@ -69,6 +71,7 @@ final class TapEngine {
     }
 
     func shutdown() {
+        wantsIO = false
         stopGraph()
         defaultDeviceListener = nil
         for (key, tap) in taps { destroy(tap, key: key) }
@@ -100,6 +103,7 @@ final class TapEngine {
         if let slot = order.firstIndex(of: key) {
             renderer.setGain(gain, slot: slot)
         }
+        reconcile(reason: "gain \(key.raw)")
     }
 
     func release(_ key: SourceID) { release([key]) }
@@ -119,23 +123,63 @@ final class TapEngine {
     }
 
     func suspend() {
-        guard state == .active else { return }
-        teardownIO()
-        state = .suspended
-        log.debug("suspended: IOProc torn down, \(self.order.count) taps kept")
+        guard wantsIO else { return }
+        wantsIO = false
+        reconcile(reason: "suspend")
     }
 
     func resume() {
-        guard state == .suspended else { return }
-        guard aggregateID != AudioObjectID(kAudioObjectUnknown) else {
-            rebuild(reason: "resume")
+        guard !wantsIO else { return }
+        wantsIO = true
+        reconcile(reason: "resume")
+    }
+
+    private var needsGraph: Bool {
+        order.contains { (gains[$0] ?? 1) != 1 }
+    }
+
+    private func reconcile(reason: String) {
+        guard !order.isEmpty else {
+            dropGraph()
+            state = .idle
+            lastError = nil
+            retryIndex = 0
             return
         }
-        guard startIO() else {
-            stopGraph()
+        guard needsGraph else {
+            dropGraph()
+            state = .suspended
+            lastError = nil
+            retryIndex = 0
+            applyMuteBehaviors()
             return
         }
-        state = .active
+        guard aggregateID != AudioObjectID(kAudioObjectUnknown), !state.isFailed else {
+            rebuild(reason: reason)
+            return
+        }
+        if wantsIO, ioProcID == nil {
+            guard startIO() else {
+                renderer.clearSlots()
+                stopGraph()
+                return
+            }
+            state = .active
+            log.debug("resumed (\(reason, privacy: .public)): IOProc started")
+        } else if !wantsIO, ioProcID != nil {
+            teardownIO()
+            state = .suspended
+            log.debug("suspended (\(reason, privacy: .public)): IOProc torn down, \(self.order.count) taps kept")
+        }
+        applyMuteBehaviors()
+    }
+
+    private func dropGraph() {
+        guard aggregateID != AudioObjectID(kAudioObjectUnknown) || ioProcID != nil else { return }
+        stopGraph()
+        renderer.clearSlots()
+        layoutSummary = "-"
+        log.debug("graph released, \(self.order.count) taps kept")
     }
 
     func retryIfDue() {
@@ -146,7 +190,42 @@ final class TapEngine {
 
     func syncObjectIDs(_ objectIDs: [AudioObjectID], for key: SourceID) {
         guard var tap = taps[key], !objectIDs.isEmpty, tap.objectIDs != objectIDs else { return }
-        let description = makeDescription(uuid: tap.uuid, objectIDs: objectIDs, key: key)
+        let behavior = muteBehavior(for: key)
+        guard writeDescription(tap, key: key, objectIDs: objectIDs, behavior: behavior) else {
+            return
+        }
+        tap.objectIDs = objectIDs
+        tap.behavior = behavior
+        taps[key] = tap
+        log.debug("tap \(key.raw, privacy: .public) now covers \(objectIDs.count) process objects")
+    }
+
+    private func muteBehavior(for key: SourceID) -> CATapMuteBehavior {
+        guard ioProcID == nil else { return .mutedWhenTapped }
+        return (gains[key] ?? 1) == 1 ? .mutedWhenTapped : .muted
+    }
+
+    private func applyMuteBehaviors() {
+        for key in order {
+            guard var tap = taps[key] else { continue }
+            let wanted = muteBehavior(for: key)
+            guard tap.behavior != wanted else { continue }
+            guard writeDescription(tap, key: key, objectIDs: tap.objectIDs, behavior: wanted)
+            else { continue }
+            tap.behavior = wanted
+            taps[key] = tap
+            log.debug(
+                "tap \(key.raw, privacy: .public) mute behavior -> \(behaviorName(wanted), privacy: .public)"
+            )
+        }
+    }
+
+    private func writeDescription(
+        _ tap: Tap, key: SourceID, objectIDs: [AudioObjectID], behavior: CATapMuteBehavior
+    ) -> Bool {
+        let description = makeDescription(
+            uuid: tap.uuid, objectIDs: objectIDs, key: key, behavior: behavior
+        )
         var address = propertyAddress(kAudioTapPropertyDescription)
         var object: CATapDescription? = description
         let size = UInt32(MemoryLayout<CATapDescription?>.size)
@@ -155,16 +234,28 @@ final class TapEngine {
         }
         guard status == noErr else {
             log.error("tap description update failed for \(key.raw, privacy: .public): \(statusName(status), privacy: .public)")
-            return
+            return false
         }
-        tap.objectIDs = objectIDs
-        taps[key] = tap
-        log.debug("tap \(key.raw, privacy: .public) now covers \(objectIDs.count) process objects")
+        return true
+    }
+
+    private func liveBehavior(_ tapID: AudioObjectID) -> String {
+        var address = propertyAddress(kAudioTapPropertyDescription)
+        var size = UInt32(MemoryLayout<CATapDescription?>.size)
+        var raw: Unmanaged<CATapDescription>?
+        let status = withUnsafeMutablePointer(to: &raw) { pointer in
+            AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, pointer)
+        }
+        guard status == noErr, let raw else { return "?" }
+        return behaviorName(raw.takeRetainedValue().muteBehavior)
     }
 
     private func createTap(key: SourceID, objectIDs: [AudioObjectID]) -> Bool {
         let uuid = UUID()
-        let description = makeDescription(uuid: uuid, objectIDs: objectIDs, key: key)
+        let behavior = muteBehavior(for: key)
+        let description = makeDescription(
+            uuid: uuid, objectIDs: objectIDs, key: key, behavior: behavior
+        )
         var tapID = AudioObjectID(kAudioObjectUnknown)
         let status = AudioHardwareCreateProcessTap(description, &tapID)
         guard status == noErr, tapID != AudioObjectID(kAudioObjectUnknown) else {
@@ -172,19 +263,19 @@ final class TapEngine {
             log.error("tap creation failed for \(key.raw, privacy: .public): \(statusName(status), privacy: .public)")
             return false
         }
-        taps[key] = Tap(tapID: tapID, uuid: uuid, objectIDs: objectIDs)
+        taps[key] = Tap(tapID: tapID, uuid: uuid, objectIDs: objectIDs, behavior: behavior)
         order.append(key)
         return true
     }
 
     private func makeDescription(
-        uuid: UUID, objectIDs: [AudioObjectID], key: SourceID
+        uuid: UUID, objectIDs: [AudioObjectID], key: SourceID, behavior: CATapMuteBehavior
     ) -> CATapDescription {
         let description = CATapDescription(stereoMixdownOfProcesses: objectIDs)
         description.uuid = uuid
         description.name = "buried-anchor \(key.raw)"
         description.isPrivate = true
-        description.muteBehavior = .mutedWhenTapped
+        description.muteBehavior = behavior
         description.isProcessRestoreEnabled = true
         return description
     }
@@ -200,6 +291,16 @@ final class TapEngine {
             lastError = nil
             retryIndex = 0
             layoutSummary = "-"
+            return
+        }
+        guard needsGraph else {
+            renderer.clearSlots()
+            state = .suspended
+            lastError = nil
+            retryIndex = 0
+            layoutSummary = "-"
+            applyMuteBehaviors()
+            log.debug("graph not needed (\(reason, privacy: .public)): no controlled gain renders")
             return
         }
         guard let device = usableDefaultOutput() else {
@@ -224,19 +325,24 @@ final class TapEngine {
             sampleRate = layout.sampleRate
             renderer.apply(layout, gains: order.map { gains[$0] ?? 1 })
             renderer.configure(sampleRate: layout.sampleRate, framesPerBuffer: bufferFrames())
-            guard startIO() else {
-                renderer.clearSlots()
-                stopGraph()
-                return
+            if wantsIO {
+                guard startIO() else {
+                    renderer.clearSlots()
+                    stopGraph()
+                    return
+                }
+                state = .active
+            } else {
+                state = .suspended
             }
             outputDeviceID = device.id
             signature = deviceSignature(device.id)
             layoutSummary = layout.summary
             installDeviceListeners()
-            state = .active
+            applyMuteBehaviors()
             lastError = nil
             retryIndex = 0
-            log.debug("graph up (\(reason, privacy: .public)): \(layout.summary, privacy: .public)")
+            log.debug("graph up (\(reason, privacy: .public)) io=\(self.wantsIO): \(layout.summary, privacy: .public)")
         }
     }
 
@@ -513,7 +619,7 @@ final class TapEngine {
 
     func diagnostics() -> [String] {
         var lines: [String] = [
-            "state=\(state)",
+            "state=\(state) wantsIO=\(wantsIO) needsGraph=\(needsGraph)",
             "output=\(outputDeviceName) id=\(outputDeviceID)",
             "layout=\(layoutSummary)",
             "taps=\(order.map(\.raw).joined(separator: ","))"
@@ -523,13 +629,14 @@ final class TapEngine {
             let format = tap.tapID.optionalValue(
                 propertyAddress(kAudioTapPropertyFormat), of: AudioStreamBasicDescription.self
             )
-            lines.append(
-                "tap \(key.raw) id=\(tap.tapID) objects=\(tap.objectIDs.count)"
-                    + " ch=\(format.map { Int($0.mChannelsPerFrame) } ?? -1)"
-                    + " rate=\(format.map { Int($0.mSampleRate) } ?? -1)"
-                    + " float32=\(format?.isFloat32 ?? false)"
-                    + " flags=\(format.map { String($0.mFormatFlags, radix: 2) } ?? "-")"
-            )
+            let channels: Int = format.map { Int($0.mChannelsPerFrame) } ?? -1
+            let rate: Int = format.map { Int($0.mSampleRate) } ?? -1
+            let flags: String = format.map { String($0.mFormatFlags, radix: 2) } ?? "-"
+            var line = "tap \(key.raw) id=\(tap.tapID) objects=\(tap.objectIDs.count)"
+            line += " mute=\(behaviorName(tap.behavior))/\(liveBehavior(tap.tapID))"
+            line += " ch=\(channels) rate=\(rate)"
+            line += " float32=\(format?.isFloat32 ?? false) flags=\(flags)"
+            lines.append(line)
         }
         guard aggregateID != AudioObjectID(kAudioObjectUnknown) else {
             lines.append("no aggregate")

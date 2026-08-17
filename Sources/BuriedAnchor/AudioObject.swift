@@ -143,3 +143,12 @@ func fourCC(_ value: UInt32) -> String {
 func statusName(_ status: OSStatus) -> String {
     status == noErr ? "noErr" : "\(fourCC(UInt32(bitPattern: status)))(\(status))"
 }
+
+func behaviorName(_ behavior: CATapMuteBehavior) -> String {
+    switch behavior {
+    case .unmuted: "unmuted"
+    case .muted: "muted"
+    case .mutedWhenTapped: "mutedWhenTapped"
+    @unknown default: "unknown"
+    }
+}

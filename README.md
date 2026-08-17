@@ -59,18 +59,27 @@ current default output device, with one `AudioDeviceIOProcID` on it.
   get the mix on their front pair with the rest cleared. A layout we cannot map — not 32-bit float,
   no output channels, taps that don't line up — is rejected: the graph is torn down, the panel shows
   why, and every app stays on its own direct output.
-- Taps use `.mutedWhenTapped`, so an app's direct path is silenced only while we are reading it.
-  We then re-render it at the chosen gain into the aggregate's output buffers.
+- While we are rendering, taps use `.mutedWhenTapped`, so an app's direct path is silenced only for
+  as long as we are reading it. We then re-render it at the chosen gain into the aggregate's output
+  buffers. While we are *not* rendering, every tap not sitting at exactly 100% is switched to
+  `.muted`, which silences the app for as long as the tap exists without any reading client — that is
+  what lets the engine stop rendering the moment an app goes quiet instead of letting its next burst
+  escape at full volume.
 - Gain is applied with `vDSP_vrampmuladd`, which multiplies by a per-frame ramp and accumulates
   into the output — gain and summing in one pass, with a 30 ms ramp so slider moves don't zipper.
 - An app gets a tap the first time its slider leaves 100%, or as soon as it appears with a volume
   you saved earlier — before it starts playing, so the first notification chime is already at the
   level you chose. Apps you never touch stay entirely outside the graph and are bit-transparent.
-- Once every controlled app is back at exactly 100%, *or* once none of them is running any more, the
-  engine suspends itself after 1.5 s: the IOProc is torn down while the taps and the aggregate stay
-  alive. Each app returns to its own bit-transparent output, and macOS drops the purple system-audio
-  indicator. Any slider leaving 100% resumes it immediately, which costs one `AudioDeviceStart`
-  rather than a rebuild.
+- The IOProc runs only while an app you have actually moved off 100% (and off 0%) is playing. Once
+  no such app is playing, the engine tears the IOProc down after 1.5 s while the taps and the
+  aggregate stay alive; apps at 100% return to their own bit-transparent output, apps you turned
+  down or muted are held silent by their tap. Playback starting again resumes it, which costs one
+  `AudioDeviceStart` rather than a rebuild.
+- **This is why Buried Anchor does not steal your AirPods.** A running IOProc makes macOS count this
+  Mac as actively playing audio, which is the signal AirPods automatic switching arbitrates on: a Mac
+  that never stops playing pulls them off your iPhone and never hands them back. Because the IOProc
+  only runs while something is really being rendered, an idle mixer — including one with an app muted
+  at 0% — registers as playing nothing at all.
 - A tap whose app has been gone for five minutes is released, but only while the engine is suspended
   or nothing controlled is playing, so reclaiming a slot never interrupts audio. Your saved volume
   is kept; only the runtime tap goes. At the 32-slot cap a playing app can evict the
@@ -136,6 +145,7 @@ whatever volume the app had before the run.
 | `--selftest <match> <pct> [--switch]` | boost, mute, and optionally a default-device switch mid-playback |
 | `--multi <a> <pctA> <b> <pctB>` | two sources, gains swapped, then one muted |
 | `--suspend <match>` | 50% → 100% → 50%, checking the middle step stops rendering but keeps the tap |
+| `--capture <match>` | 150% → 0% → 150% → 100%, checking we report `IsRunningOutput` only while rendering — the AirPods-stealing regression test |
 | `--watch <seconds>` | dumps the row list every 3 s; `*` playing, `!` rendering, `?` tapped but idle |
 | `--loginitem` | round-trips the login-item registration |
 

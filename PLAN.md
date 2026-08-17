@@ -50,6 +50,16 @@ Plan: the prompt *"only fires on a signed binary with deployment target ≥ 14.4
 
 Run from a terminal, the *terminal* is the responsible process; it has no usage description, so TCC auto-denies with no UI. Any dev loop that runs the binary directly will look permanently broken.
 
+**❌ 6b. A global tap cannot be used to check whether muting worked.** (Added after the
+device-capture fix; the mistake cost several test cycles.) The obvious instrument for "did this app's
+audio actually reach the speakers" is `CATapDescription(monoGlobalTapButExcludeProcesses:)` in its own
+aggregate. It does not work: the global tap is taken at the same point as a process tap, **before**
+per-process mute is applied to the device path. Measured with a 440 Hz tone at amplitude 0.025, the
+monitor read `0.0250` in all three states — unmuted pass-through, `.mutedWhenTapped` with our IOProc
+running (the shipped, known-working mute), and `.muted` with no IOProc. A run that appears to show a
+drop is contamination from some other process in the mix, not the target being silenced. There is no
+HAL-level instrument for this; whether a mute is audible has to be checked by ear.
+
 **❌ 6. The "all-zero buffers" bug is over-attributed to an unresolved Apple bug.**
 Plain TCC denial presents **identically**: IOProc fires with valid timestamps at full rate, every sample `0.0`. My first run: 326 cycles, peak `0.00000`. Do not build a teardown/rebuild watchdog around that symptom without first discriminating the cause. The reliable discriminator is real and worth building in:
 

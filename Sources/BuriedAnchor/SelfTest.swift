@@ -7,7 +7,8 @@ enum SelfTest {
     static let path = "/tmp/buriedanchor-selftest.log"
 
     private static let modes = [
-        "--selftest", "--multi", "--watch", "--suspend", "--loginitem", "--layout", "--render"
+        "--selftest", "--multi", "--watch", "--suspend", "--loginitem", "--layout", "--render",
+        "--capture"
     ]
 
     private static var failures = 0
@@ -51,6 +52,56 @@ enum SelfTest {
             expect(c > a * 0.7, "resumed at 50%", "did not resume: A=\(fmt(a)) C=\(fmt(c))")
             expect(isControlled(model, target.id), "tap kept across the cycle", "tap was released")
 
+            restore(model, target.id, saved)
+            finish(model)
+        }
+    }
+
+    static func runCapture(model: MixerModel) {
+        let arguments = CommandLine.arguments
+        guard let index = arguments.firstIndex(of: "--capture") else { return }
+        let match = index + 1 < arguments.count ? arguments[index + 1] : ""
+
+        note("=== capture match=\(match) ===")
+        model.start()
+        note("permission=\(model.permission) output=\(model.outputDeviceName)")
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(900))
+            guard let target = playing(model, matching: match) else {
+                fail("no playing row matching '\(match)'")
+                finish(model)
+                return
+            }
+            note("target=\(target.id.raw)")
+            let saved = model.savedPercent(for: target.id)
+
+            model.setPercent(150, for: target.id)
+            try? await Task.sleep(for: .milliseconds(1500))
+            let level = await measure(model, id: target.id, seconds: 2, settle: 0.3)
+            note("A 150%: holdsOutput=\(holdsOutput()) deviceRunning=\(deviceRunning()) peak=\(fmt(level))")
+            expect(holdsOutput(), "the graph holds the output device while rendering", "not rendering at 150%")
+            expect(level > 0, "the target renders at 150%", "no level at 150%")
+
+            model.setPercent(0, for: target.id)
+            try? await Task.sleep(for: .milliseconds(3500))
+            note("B 0%: holdsOutput=\(holdsOutput()) deviceRunning=\(deviceRunning()) controlled=\(isControlled(model, target.id))")
+            expect(!holdsOutput(), "a muted row lets go of the output device", "still holding the device at 0%")
+            expect(isControlled(model, target.id), "the tap is kept while muted", "the tap was released at 0%")
+
+            model.setPercent(150, for: target.id)
+            try? await Task.sleep(for: .milliseconds(1500))
+            let resumed = await measure(model, id: target.id, seconds: 2, settle: 0.3)
+            note("C 150% again: holdsOutput=\(holdsOutput()) peak=\(fmt(resumed))")
+            expect(holdsOutput(), "the device is taken back when rendering resumes", "did not take the device back")
+            expect(resumed > 0, "rendering again after the muted gap", "no level after the muted gap")
+
+            model.setPercent(100, for: target.id)
+            try? await Task.sleep(for: .milliseconds(3500))
+            note("D 100%: holdsOutput=\(holdsOutput()) deviceRunning=\(deviceRunning())")
+            expect(!holdsOutput(), "a unity row lets go of the output device", "still holding the device at 100%")
+
+            for line in model.engineDiagnostics() { note(line) }
             restore(model, target.id, saved)
             finish(model)
         }
@@ -522,6 +573,27 @@ enum SelfTest {
 
     private static func isControlled(_ model: MixerModel, _ id: SourceID) -> Bool {
         model.rows.first { $0.id == id }?.isControlled ?? false
+    }
+
+    private static func ownProcessObjects() -> [AudioObjectID] {
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        return systemObject
+            .array(propertyAddress(kAudioHardwarePropertyProcessObjectList), of: AudioObjectID.self)
+            .filter {
+                $0.value(propertyAddress(kAudioProcessPropertyPID), default: pid_t(-1)) == ownPID
+            }
+    }
+
+    private static func holdsOutput() -> Bool {
+        ownProcessObjects().contains {
+            $0.value(propertyAddress(kAudioProcessPropertyIsRunningOutput), default: UInt32(0)) != 0
+        }
+    }
+
+    private static func deviceRunning() -> Bool {
+        defaultOutput().value(
+            propertyAddress(kAudioDevicePropertyDeviceIsRunningSomewhere), default: UInt32(0)
+        ) != 0
     }
 
     private static func controlledCount(_ model: MixerModel) -> Int {

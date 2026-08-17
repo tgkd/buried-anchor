@@ -47,7 +47,7 @@ final class MixerModel {
     private var activityListeners: [AudioObjectID: PropertyListener] = [:]
     private var reconcilePending = false
     private var tick = 0
-    private var unitySince: Date?
+    private var idleSince: Date?
     private var started = false
     private var presentation: [SourceID: Presentation] = [:]
     private var lastPlaying: [SourceID: Date] = [:]
@@ -117,7 +117,7 @@ final class MixerModel {
         rows[index].isControlled = engine.isControlled(id)
         rows[index].isActive = engine.isActive(id)
         engineError = engine.lastError
-        unitySince = nil
+        idleSince = nil
         updateSuspension()
     }
 
@@ -228,19 +228,21 @@ final class MixerModel {
     private func updateSuspension() {
         let keys = engine.controlledKeys
         guard !keys.isEmpty else {
-            unitySince = nil
+            idleSince = nil
             return
         }
-        let atUnity = keys.allSatisfy { engine.gain(for: $0) == 1 }
-        let anyLive = keys.contains { liveKeys.contains($0) }
-        guard atUnity || !anyLive else {
-            unitySince = nil
+        let rendering = keys.contains { key in
+            let gain = engine.gain(for: key)
+            return gain != 0 && gain != 1 && playingKeys.contains(key)
+        }
+        guard !rendering else {
+            idleSince = nil
             engine.resume()
             return
         }
         let now = Date()
-        let since = unitySince ?? now
-        unitySince = since
+        let since = idleSince ?? now
+        idleSince = since
         guard now.timeIntervalSince(since) >= suspendAfter else { return }
         engine.suspend()
     }

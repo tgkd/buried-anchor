@@ -42,6 +42,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             SelfTest.runSuspend(model: model)
             return
         }
+        if CommandLine.arguments.contains("--capture") {
+            SelfTest.runCapture(model: model)
+            return
+        }
         if CommandLine.arguments.contains("--multi") {
             SelfTest.runMulti(model: model)
             return
