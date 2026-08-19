@@ -68,9 +68,21 @@ final class ProcessRegistry {
         }
     }
 
-    private func currentProcesses() -> [AudioProcess] {
+    func objectIDList() -> [AudioObjectID] {
         systemObject
             .array(propertyAddress(kAudioHardwarePropertyProcessObjectList), of: AudioObjectID.self)
+    }
+
+    func owner(of objectID: AudioObjectID) -> SourceID? {
+        let pid = objectID.value(propertyAddress(kAudioProcessPropertyPID), default: pid_t(-1))
+        guard pid > 0, pid != ownPID else { return nil }
+        return identify(
+            AudioProcess(objectID: objectID, pid: pid, bundleID: nil, isRunningOutput: true)
+        )?.key
+    }
+
+    private func currentProcesses() -> [AudioProcess] {
+        objectIDList()
             .map { objectID in
                 AudioProcess(
                     objectID: objectID,

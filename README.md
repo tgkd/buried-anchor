@@ -74,7 +74,10 @@ current default output device, with one `AudioDeviceIOProcID` on it.
   no such app is playing, the engine tears the IOProc down after 1.5 s while the taps and the
   aggregate stay alive; apps at 100% return to their own bit-transparent output, apps you turned
   down or muted are held silent by their tap. Playback starting again resumes it, which costs one
-  `AudioDeviceStart` rather than a rebuild.
+  `AudioDeviceStart` rather than a rebuild. Playback starting is caught by a process property
+  listener rather than by the poll, and a *new* process — the `afplay` a terminal spawns for a
+  notification sound — joins its app's tap and starts the graph while it is still opening its audio,
+  so its first fraction of a second is not played at full volume.
 - **This is why Buried Anchor does not steal your AirPods.** A running IOProc makes macOS count this
   Mac as actively playing audio, which is the signal AirPods automatic switching arbitrates on: a Mac
   that never stops playing pulls them off your iPhone and never hands them back. Because the IOProc
@@ -119,6 +122,7 @@ crossed slot would show up in the numbers: player A peaks at `0.0073`, player B 
 | Suspend at 100% | 50% → `0.0037`, 100% → `0.0002` (no render), 50% again → `0.0037`, tap kept |
 | Suspend when the app exits | controlled app killed → graph suspends while its tap is kept |
 | Saved volume applied before playback | app relaunched with a saved 50% is tapped as it appears |
+| Notification sound through a muted app | the new `afplay` process joins the tap 38 ms before its first sample and the IOProc is running within 10 ms of it (was 190–840 ms after it) |
 | Default output change mid-playback | Bluetooth → built-in → Bluetooth, peak held at `0.0110` across both, slots preserved, no error |
 | Layout on built-in speakers | `inputBuffers=[2]` for 1 tap, offset 0, output `[2]` interleaved float32 |
 | Layout on a Bluetooth headset with a mic | `inputBuffers=[2,2]` for 2 taps, offset 0 — macOS exposes the mic as a **separate** device object, so it contributes no input stream |

@@ -44,7 +44,9 @@ final class MixerModel {
     private var premute: [SourceID: Double] = [:]
     private var timer: Timer?
     private var processListListener: PropertyListener?
-    private var activityListeners: [AudioObjectID: PropertyListener] = [:]
+    private var activityListeners: [AudioObjectID: [PropertyListener]] = [:]
+    private var objectOwners: [AudioObjectID: SourceID] = [:]
+    private var objectBaseline = false
     private var reconcilePending = false
     private var tick = 0
     private var idleSince: Date?
@@ -59,6 +61,10 @@ final class MixerModel {
     private let meterFloor: Float = 0.0002
     private let lingerInterval: TimeInterval = 300
     private let tapRetention: TimeInterval = 300
+    private static let activitySelectors: [AudioObjectPropertySelector] = [
+        kAudioProcessPropertyIsRunning,
+        kAudioProcessPropertyIsRunningOutput
+    ]
     private static let defaultsKey = "appVolumePercents"
     private static let premuteKey = "appVolumePremute"
     private static let softClipKey = "softClip"
@@ -83,7 +89,7 @@ final class MixerModel {
             systemObject,
             propertyAddress(kAudioHardwarePropertyProcessObjectList)
         ) { [weak self] in
-            Task { @MainActor in self?.scheduleReconcile() }
+            Task { @MainActor in self?.handleProcessListChange() }
         }
         refreshList()
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -262,13 +268,60 @@ final class MixerModel {
             activityListeners.removeValue(forKey: objectID)
         }
         for objectID in objectIDs where activityListeners[objectID] == nil {
-            activityListeners[objectID] = PropertyListener(
-                objectID,
-                propertyAddress(kAudioProcessPropertyIsRunningOutput)
-            ) { [weak self] in
-                Task { @MainActor in self?.scheduleReconcile() }
+            activityListeners[objectID] = Self.activitySelectors.compactMap { selector in
+                PropertyListener(objectID, propertyAddress(selector)) { [weak self] in
+                    Task { @MainActor in self?.handleActivityChange() }
+                }
             }
         }
+    }
+
+    private func handleProcessListChange() {
+        coverNewObjects()
+        scheduleReconcile()
+    }
+
+    private func coverNewObjects() {
+        let live = registry.objectIDList()
+        let fresh = live.filter { objectOwners[$0] == nil }
+        guard !fresh.isEmpty else { return }
+        var waking = false
+        for objectID in fresh {
+            guard let key = registry.owner(of: objectID), isManaged(key) else { continue }
+            objectOwners[objectID] = key
+            waking = true
+            guard engine.isControlled(key) else { continue }
+            engine.syncObjectIDs(live.filter { objectOwners[$0] == key }.sorted(), for: key)
+        }
+        guard waking else { return }
+        idleSince = nil
+        engine.resume()
+    }
+
+    private func handleActivityChange() {
+        pulsePlayback()
+        updateSuspension()
+        scheduleReconcile()
+    }
+
+    private func pulsePlayback() {
+        let controlled = Set(engine.controlledKeys)
+        guard !controlled.isEmpty else { return }
+        var running: Set<SourceID> = []
+        for (objectID, key) in objectOwners where controlled.contains(key) {
+            guard objectID.value(
+                propertyAddress(kAudioProcessPropertyIsRunningOutput), default: UInt32(0)
+            ) != 0 else { continue }
+            running.insert(key)
+        }
+        playingKeys.subtract(controlled)
+        playingKeys.formUnion(running)
+        let now = Date()
+        for key in running { lastPlaying[key] = now }
+    }
+
+    private func isManaged(_ key: SourceID) -> Bool {
+        engine.isControlled(key) || (percents[key].map { $0 != 100 } ?? false)
     }
 
     private func onTick() {
@@ -279,6 +332,7 @@ final class MixerModel {
             registry.forgetTerminated()
         }
         refreshMeters()
+        pulsePlayback()
         updateSuspension()
         if outputDeviceName != engine.outputDeviceName {
             outputDeviceName = engine.outputDeviceName
@@ -294,6 +348,17 @@ final class MixerModel {
         let now = Date()
         liveKeys = Set(groups.filter { !$0.objectIDs.isEmpty }.map(\.id))
         playingKeys = Set(groups.filter(\.isPlaying).map(\.id))
+
+        let owners = groups.reduce(into: [AudioObjectID: SourceID]()) { map, group in
+            for objectID in group.objectIDs { map[objectID] = group.id }
+        }
+        let appeared = objectBaseline ? Set(owners.keys).subtracting(objectOwners.keys) : []
+        objectBaseline = true
+        objectOwners = owners
+        if appeared.contains(where: { owners[$0].map(isManaged) ?? false }) {
+            idleSince = nil
+            engine.resume()
+        }
 
         for group in groups {
             presentation[group.id] = Presentation(name: group.name, icon: group.icon)

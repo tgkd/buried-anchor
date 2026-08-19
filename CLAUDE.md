@@ -95,9 +95,18 @@ with `make logs` (or `log stream`) running alongside the test, which is the only
 from a single 100 ms timer: every tick refreshes meters, drives suspension and services the engine's
 retry backoff; every 10th tick re-snapshots the process list. That poll is a backstop, not the
 primary signal — property listeners on `kAudioHardwarePropertyProcessObjectList`, on
-`kAudioProcessPropertyIsRunningOutput` for *every* discovered process object, and on
-`kAudioHardwarePropertyDefaultOutputDevice` drive reconciliation, coalesced through
-`scheduleReconcile` so a burst of listener fires costs one `refreshList`.
+`kAudioProcessPropertyIsRunning` and `kAudioProcessPropertyIsRunningOutput` for *every* discovered
+process object, and on `kAudioHardwarePropertyDefaultOutputDevice` drive reconciliation, coalesced
+through `scheduleReconcile` so a burst of listener fires costs one `refreshList`.
+
+**The HAL never sends `kAudioProcessPropertyIsRunningOutput` notifications** — measured on macOS 27,
+both from inside the app and from a separate process holding a listener on that selector while the
+process it watched started playing. `kAudioProcessPropertyIsRunning` *does* fire, in the same
+millisecond output starts, which is why both selectors are listened to and why `pulsePlayback`
+re-reads `IsRunningOutput` for the controlled apps' process objects on every 100 ms tick — a few
+property reads, not the 15–25 ms `registry.snapshot()`. Before that, playback starting was only ever
+noticed by the 1 s poll, so a suspended graph took 190–840 ms to resume and everything the app
+played in that window escaped at full volume.
 
 **One aggregate, N taps** — not one aggregate per app. `TapEngine` keeps one `CATapDescription` per
 controlled *app* (`.mutedWhenTapped`, private, `processRestoreEnabled`) and puts them all in a single
@@ -159,8 +168,8 @@ an audible glitch for every controlled app. Buffer-size changes only reconfigure
 An app is untapped and bit-transparent until its slider first leaves 100%, or until it appears while
 carrying a saved non-unity volume — `MixerModel.refreshList` prepares the tap as soon as the app has
 audio process objects, so playback does not start at the wrong level while a 1 s poll catches up.
-Per-process `kAudioProcessPropertyIsRunningOutput` listeners (coalesced through
-`scheduleReconcile`) drive that, with the poll left as a backstop.
+Per-process activity listeners (coalesced through `scheduleReconcile`) drive that, with the poll
+left as a backstop.
 
 `MixRenderer.maxSlots` (32) caps controlled apps, and slots are now reclaimed: a tap whose app has
 had no process objects for 5 minutes is released, but `sweepRetention` defers that until the engine
@@ -179,6 +188,13 @@ Two things move independently, decided in one place — `TapEngine.reconcile`:
   playing*. `MixerModel.updateSuspension` waits 1.5 s (wall clock, since listener-driven reconciles
   make tick counting irregular) before tearing it down, and resumes the moment such an app starts
   playing again.
+- **A new process object of a managed app pre-rolls the IOProc**, muted rows included.
+  `coverNewObjects` runs off the process-list listener, resolves only the *fresh* object IDs, adds
+  them to their app's tap and calls `resume()`; the 1.5 s idle rule takes the IOProc down again. A
+  process object appears ~40 ms before that process's first sample and `AudioDeviceStart` costs
+  10–45 ms, so this is what gets the graph up in time. Without it, a notification sound played by a
+  freshly spawned child process (the `afplay` a terminal runs) escaped at full volume: `.muted` does
+  not silence a process added to a tap that has no running IOProc.
 
 Whenever the IOProc is down, every tap whose gain is not 1 is switched from `.mutedWhenTapped` to
 `.muted` (`applyMuteBehaviors`, written through `kAudioTapPropertyDescription` on the live tap, the
@@ -186,7 +202,9 @@ same way `syncObjectIDs` rewrites the process list). `CATapMuted` silences the p
 the tap exists, with no reading client — which is what lets the engine stop rendering while an app is
 merely silent. Without it a suspended graph is a pass-through graph and the first buffers after
 playback resumes escape at full volume, which for a muted app is an audible burst. A tap at exactly
-gain 1 keeps `.mutedWhenTapped`, which with no IOProc means bit-transparent pass-through.
+gain 1 keeps `.mutedWhenTapped`, which with no IOProc means bit-transparent pass-through. `.muted`
+only covers processes the tap already held while it was engaged, which is why a *newly appeared*
+process pre-rolls the IOProc instead of relying on it.
 
 Why this matters far beyond power: a running IOProc makes the HAL report **our own process** as
 `kAudioProcessPropertyIsRunningOutput`, and that is the signal macOS arbitrates AirPods automatic
