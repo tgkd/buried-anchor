@@ -46,149 +46,121 @@ and every captured sample arrives as `0.0` while the IOProc keeps firing normall
 
 ## How it works
 
-One tap per controlled app, all taps in a **single private aggregate device** built around the
-current default output device, with one `AudioDeviceIOProcID` on it.
+Buried Anchor controls volume by capturing an app's output, suppressing that original path, and
+rendering the captured samples at the requested gain. It uses public Core Audio process taps and a
+private aggregate; it does not install an audio driver or change a native per-process volume knob.
 
-- Each sub-tap contributes its own input stream to the aggregate. Which input buffer belongs to
-  which app is **discovered after the aggregate comes up**, not assumed: the tap order is read back
-  from `kAudioAggregateDevicePropertyTapList`, and the taps are located inside the aggregate's input
-  buffer list by matching their channel counts, so any input streams a duplex sub-device contributes
-  ahead of them are skipped rather than rendered as somebody's audio.
-- The output side is mapped the same way. Every output stream's channel is given an explicit
-  buffer/offset/stride, so non-interleaved devices get both buffers written and multichannel devices
-  get the mix on their front pair with the rest cleared. A layout we cannot map — not 32-bit float,
-  no output channels, taps that don't line up — is rejected: the graph is torn down, the panel shows
-  why, and every app stays on its own direct output.
-- While we are rendering, taps use `.mutedWhenTapped`, so an app's direct path is silenced only for
-  as long as we are reading it. We then re-render it at the chosen gain into the aggregate's output
-  buffers. While we are *not* rendering, every tap not sitting at exactly 100% is switched to
-  `.muted`, which silences the app for as long as the tap exists without any reading client — that is
-  what lets the engine stop rendering the moment an app goes quiet instead of letting its next burst
-  escape at full volume.
-- Gain is applied with `vDSP_vrampmuladd`, which multiplies by a per-frame ramp and accumulates
-  into the output — gain and summing in one pass, with a 30 ms ramp so slider moves don't zipper.
-- An app gets a tap the first time its slider leaves 100%, or as soon as it appears with a volume
-  you saved earlier — before it starts playing, so the first notification chime is already at the
-  level you chose. Apps you never touch stay entirely outside the graph and are bit-transparent.
-- The IOProc runs only while an app you have actually moved off 100% (and off 0%) is playing. Once
-  no such app is playing, the engine tears the IOProc down after 1.5 s while the taps and the
-  aggregate stay alive; apps at 100% return to their own bit-transparent output, apps you turned
-  down or muted are held silent by their tap. Playback starting again resumes it, which costs one
-  `AudioDeviceStart` rather than a rebuild. Playback starting is caught by a process property
-  listener rather than by the poll, and a *new* process — the `afplay` a terminal spawns for a
-  notification sound — joins its app's tap and starts the graph while it is still opening its audio,
-  so its first fraction of a second is not played at full volume.
-- **This is why Buried Anchor does not steal your AirPods.** A running IOProc makes macOS count this
-  Mac as actively playing audio, which is the signal AirPods automatic switching arbitrates on: a Mac
-  that never stops playing pulls them off your iPhone and never hands them back. Because the IOProc
-  only runs while something is really being rendered, an idle mixer — including one with an app muted
-  at 0% — registers as playing nothing at all.
-- A tap whose app has been gone for five minutes is released, but only while the engine is suspended
-  or nothing controlled is playing, so reclaiming a slot never interrupts audio. Your saved volume
-  is kept; only the runtime tap goes. At the 32-slot cap a playing app can evict the
-  least-recently-active idle one.
+The supported destination is the **default output device with one mono or stereo output stream**.
+An app using another destination or multiple devices is left untouched and marked unsupported.
+Device-and-stream taps restrict capture to the verified destination. A process-wide stereo-mixdown
+tap is unsuitable for that restriction: macOS 27 discarded its `deviceUID` in live readback.
 
-Above 100% the output can exceed full scale. Default is a hard clip at ±1.0 with a clip indicator;
-Settings › Soft clip switches to `tanhf` saturation above a 0.7 knee.
+- **100% is bypass.** Returning to unity releases the app's tap, even when other apps remain controlled.
+- **0% is explicit mute.** A verified `.muted` tap can hold an app silent without keeping output IO active.
+- Nonzero adjusted sources use `.mutedWhenTapped` while rendering. Dormant adjusted sources are held
+  by `.muted`; activity resumes rendering. New members can pre-roll IO for 1.5 seconds, including
+  mute-only sources, to establish capture before a short sound.
+- Before replacing a graph, the coordinator verifies mute guards, stops and destroys its IOProc,
+  destroys the aggregate, reconciles taps, validates the new layout, then starts replacement IO.
+- On failure, nonzero sources return to direct playback when that state can be verified. Explicit
+  mute is retained when verified. Failed mute/cleanup operations remain visible, and handles stay
+  owned for retry. The app never claims bypass merely because graph construction failed.
+- Retries use monotonic 1/2/5/15/30-second deadlines. A Core Audio service reset invalidates taps,
+  process IDs, cached ownership, listeners, and queued commands from the old generation; fresh
+  discovery reapplies saved settings. Wake and route/format changes trigger reconciliation.
+- One serial control queue owns graph mutations. The IO callback has preallocated storage and
+  atomic gains/meters. SwiftUI receives snapshots and updates displayed meters only when visible.
+- Gains are saved by bundle ID, or by full executable path when an owning app cannot be found.
+  Legacy short executable-name preferences are discarded to avoid applying a gain to an unrelated
+  program with the same truncated name. Bundle preferences are preserved.
+
+## Architecture
+
+| File | Responsibility |
+|---|---|
+| `ProcessRegistry.swift`, `SourceID.swift` | Process discovery, owning-app identity, presentation |
+| `MixerModel.swift` | Saved intent, rows, discovery events, UI state |
+| `TapEngine.swift` | Main-actor facade, serial control loop, generation-tagged listeners and commands |
+| `AudioCoordinator.swift` | Resource ownership, transitions, mute policy, suspension, retries, recovery |
+| `AudioHardwareBackend.swift` | HAL operations, readback verification, device-scoped taps, format discovery |
+| `GraphLayout.swift`, `Render.swift` | Validated buffer/channel mapping, smoothed gain, mixing and saturation |
+| `SelfTest.swift`, `CoordinatorChecks.swift` | Existing executable self-test modes and injected HAL failures |
+
+`AudioHardwareBackend` is injectable. Tests exercise the actual coordinator, including partial
+construction and failed destruction, without accessing real audio hardware.
+
+The renderer uses the **aggregate's delivered sample rate**, allowing differently clocked taps
+when HAL converts them. It validates buffer bounds and rejects changed callback shapes before
+mixing. The general layout resolver supports explicit stereo channel matrices and normalized mono
+fold-down; the live backend deliberately supports only the narrower verified mono/stereo topology.
 
 ## The panel
 
-Each row has a mute button that drops the app to 0% and restores the previous level when pressed
-again; the remembered level survives a quit. Right-click a row to reset it to 100% — that is a
-different operation from dragging the slider back, because it also destroys the app's tap and takes
-it out of the render graph entirely, returning it to bit-transparency and freeing one of the 32 tap
-slots. Dragging to 100% deliberately keeps the tap, since releasing it there would rebuild the
-shared aggregate every time the slider passed through 100 and interrupt every other controlled app;
-the engine suspends instead, which reaches the same silence and the same dropped indicator without
-touching the aggregate. Double-click a slider to snap it back to exactly 100%.
+Rows show playing/recent apps and saved non-unity settings, including unavailable sources. The
+percentage is requested gain; a warning indicates waiting, unsupported routing, or failed control.
+Right-click → Reset removes saved intent even if no tap could be created. Double-click a slider to
+return to 100% bypass. The mute button remembers and restores the previous percentage.
 
-Settings (⌘, or the gear in the panel) holds "Launch at login", registered through
-`SMAppService.mainApp`, and the soft-clip toggle, which persists across launches.
+Waveforms indicate activity. Controlled rendering uses measured levels; untapped apps cannot
+provide a measured level. Meter values clear when capture stops.
 
-## Verified behavior
+Settings include launch at login and optional **Soft saturation**. Saturation begins at 0.7 full
+scale and deliberately changes some unclipped signals. With it disabled, the controlled mix is hard
+clipped at full scale. Neither mode limits unmanaged apps mixed downstream by macOS.
 
-Measured on macOS 27.0 (arm64). Two players run the same 90 s tone at different source volumes so a
-crossed slot would show up in the numbers: player A peaks at `0.0073`, player B at `0.0018`.
+## Verification
 
-| Check | Result |
-|---|---|
-| Permission probe | `granted` (`kAudioTapPropertyDescription` set returns `noErr`) |
-| Gain at 150% | `0.0110` = 0.0073 × 1.5, exact |
-| Mute at 0% | `0.0000` |
-| Two apps controlled at once | 50% / 150% → `0.0037` / `0.0027` |
-| Gains swapped between them | → `0.0110` / `0.0009`; each row still tracks its **own** source amplitude, so the slot mapping did not cross |
-| One muted, other untouched | `0.0000` / `0.0009` unchanged |
-| Three taps in one aggregate | slots on input buffers 0,1,2, no error |
-| Suspend at 100% | 50% → `0.0037`, 100% → `0.0002` (no render), 50% again → `0.0037`, tap kept |
-| Suspend when the app exits | controlled app killed → graph suspends while its tap is kept |
-| Saved volume applied before playback | app relaunched with a saved 50% is tapped as it appears |
-| Notification sound through a muted app | the new `afplay` process joins the tap 38 ms before its first sample and the IOProc is running within 10 ms of it (was 190–840 ms after it) |
-| Default output change mid-playback | Bluetooth → built-in → Bluetooth, peak held at `0.0110` across both, slots preserved, no error |
-| Layout on built-in speakers | `inputBuffers=[2]` for 1 tap, offset 0, output `[2]` interleaved float32 |
-| Layout on a Bluetooth headset with a mic | `inputBuffers=[2,2]` for 2 taps, offset 0 — macOS exposes the mic as a **separate** device object, so it contributes no input stream |
-| Renderer and layout resolver | 20 hardware-free checks, exit code 0 |
+The September 2026 rework was built and tested on macOS 27.0 (26A5425a), Xcode 27 beta 6. See
+[AUDIO_MANAGEMENT_REVIEW.md](AUDIO_MANAGEMENT_REVIEW.md) for the original assessment and the
+implementation/verification record. Historical measurements in `PLAN.md` and the older architecture
+review describe previous revisions and are not certification of this implementation.
 
-Carried over from the previous build and not re-measured: helper grouping (Slack's two process
-objects collapse to one row), fallback to `exec:<name>` for processes with no bundle ID, and
-`100.19` rounding to `100` on load so no tap is created.
-
-The duplex case that the tap-offset discovery exists for — a sub-device that contributes its own
-input streams ahead of the taps — has **not** been reproduced on real hardware. The Bluetooth
-headset above does not do it. It is covered synthetically by `--render`.
-
-### Self-test modes
-
-All except `--render` must be launched via `open -a`, need real audio playing, append to
-`/tmp/buriedanchor-selftest.log`, and end with a `RESULT pass` / `RESULT fail (n)` line. They restore
-whatever volume the app had before the run.
-
-| Mode | What it checks |
-|---|---|
-| `--render` | layout resolution and rendering against synthetic buffer lists — no HAL, no TCC, no audio. The only mode that may be run as the inner binary, which is how you get an exit code |
-| `--layout <match>` | dumps the live aggregate's tap list, sub-taps, per-stream formats and buffer shapes |
-| `--selftest <match> <pct> [--switch]` | boost, mute, and optionally a default-device switch mid-playback |
-| `--multi <a> <pctA> <b> <pctB>` | two sources, gains swapped, then one muted |
-| `--suspend <match>` | 50% → 100% → 50%, checking the middle step stops rendering but keeps the tap |
-| `--capture <match>` | 150% → 0% → 150% → 100%, checking we report `IsRunningOutput` only while rendering — the AirPods-stealing regression test |
-| `--watch <seconds>` | dumps the row list every 3 s; `*` playing, `!` rendering, `?` tapped but idle |
-| `--loginitem` | round-trips the login-item registration |
-
-The multi-app test needs two distinct rows, and row identity follows the *owning* app up the parent
-chain — an `afplay` you start in a terminal groups under the terminal, not under itself. Wrap it in
-a throwaway bundle per player to get its own row:
+### Hardware-free checks
 
 ```
-mkdir -p PlayerA.app/Contents/MacOS && cp /usr/bin/afplay PlayerA.app/Contents/MacOS/PlayerA
-# Info.plist with CFBundleIdentifier com.example.PlayerA and LSUIElement
-codesign --force --sign - PlayerA.app
-open -a "$PWD/PlayerA.app" --args -v 0.03 tone.wav
+make build
+.build/debug/BuriedAnchor --render
 ```
 
-## The row list and the waveform
+This mode is the exception to the LaunchServices rule: it does not access HAL or require audio/TCC.
+It checks layouts, sample-rate validation, mono gain, selected channels, stale-buffer rejection,
+gain ramps, clipping, source isolation, failure rollback, resource ownership, retry deadlines,
+mute-before-stop ordering, unsupported routes, membership failures, and HAL reset recovery.
+It appends `PASS`/`FAIL` and a final `RESULT` to `/tmp/buriedanchor-selftest.log`, and exits nonzero
+on failure. There is no separate SwiftPM test target.
 
-Rows show apps that are playing now, apps played within the last 5 minutes, and any app whose volume
-you have changed. The linger keeps short bursts — notification sounds, terminal bells — from flashing
-in and out of the list, and it survives the app's audio process object disappearing entirely.
+### Live checks
 
-The animated waveform is an **activity indicator, not a calibrated meter**, and the distinction is
-forced by the architecture. Real amplitude is only available for apps we tap, and an app is only
-tapped once its slider leaves 100% — at exactly 100% it stays bit-transparent with no tap, so there
-are no samples to measure. So: apps you have adjusted animate from their real output level; apps
-playing at an untouched 100% animate at a fixed amplitude to show they are active; idle apps sit
-flat and dim. Making every playing app show a true level would mean tapping everything, which gives
-up bit-transparency at unity and routes audio you never asked us to touch through our render path.
+All live modes require a signed bundle launched through LaunchServices. Match a source that will
+keep playing throughout the test. Settings changed by tests are restored afterward.
 
-## Known limitations
+| Mode | Check |
+|---|---|
+| `--layout <match>` | Graph state, captured level, current tap membership and device restriction |
+| `--selftest <match> <pct> [--switch]` | Gain/mute and optional default-device switch |
+| `--multi <a> <pctA> <b> <pctB>` | Two independent sources, gain swapping, selective mute |
+| `--suspend <match>` | 50% → true 100% bypass → 50% |
+| `--capture <match>` | Rendering holds output, mute/unity release it, unmute resumes |
+| `--watch <seconds>` | Source discovery and activity |
+| `--loginitem` | Login-item registration round trip |
 
-- Only apps playing to the **default output device** are affected. An app pinned to a different
-  device is captured but its scaled audio lands on the default device.
-- Every tap is a `stereoMixdownOfProcesses`, so a multichannel or spatial source is folded to stereo
-  once you control it. On a multichannel output the mix lands on the front pair and the remaining
-  channels are silent. Leaving such an app at 100% keeps it untapped and untouched.
-- Adding or removing a controlled app rebuilds the shared aggregate, which briefly interrupts the
-  other controlled apps. Changing a gain does not.
-- Some processes cannot be traced to a user-visible app (`com.apple.WebKit.GPU` hosting Raycast
-  audio, for example) and appear under their own name.
-- If the default output device ever resolves to our own aggregate, the engine refuses to build and
-  passes audio through untouched rather than creating a feedback loop.
-- Not sandboxed. Developer ID signing + notarization would be needed to ship this to anyone else.
+Example: `open -n -W -a "$PWD/.build/BuriedAnchor.app" --args --capture PlayerA`.
+The shared log ends with `RESULT pass` or `RESULT fail (n)`. Tests measure the controlled signal and
+HAL IO state; they do not independently certify audible silence at the physical output. A second
+tap can observe audio before device-path muting and is not necessarily a valid silence detector.
+
+## Remaining limitations
+
+- Multichannel/multiple-stream output devices and per-app output selection are unsupported. The
+  app reports the restriction instead of moving or silently downmixing another route's audio.
+- Adding/removing sources, membership changes, and device reconfiguration rebuild the shared
+  graph. Mute guards avoid intentionally opening the original path, but short interruptions remain.
+- First playback after asynchronous process discovery/resume can lose an onset. This is not a
+  sample-accurate interception guarantee; short sounds and Bluetooth transitions need hardware QA.
+- If HAL fails, bypass restores the source's original level, which can be louder than its requested
+  attenuation. An unverified mute is reported as a failure, not guaranteed silence.
+- Helper ownership can be ambiguous, especially shared WebKit services. No automatic bundle-only
+  restoration is used; live members and their routes are verified explicitly.
+- Core Audio restart/failure recovery is covered by injection. Bluetooth call-mode changes,
+  physical USB hotplug, sleep/wake, and audible transition timing need hardware verification.
+- Not sandboxed. Distribution requires appropriate signing and notarization.

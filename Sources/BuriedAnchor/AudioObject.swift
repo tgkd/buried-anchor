@@ -93,9 +93,16 @@ extension AudioObjectID {
 
 extension AudioStreamBasicDescription {
     var isFloat32: Bool {
-        mFormatID == kAudioFormatLinearPCM
+        let channels = mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0 ? 1 : mChannelsPerFrame
+        return mFormatID == kAudioFormatLinearPCM
             && mFormatFlags & kAudioFormatFlagIsFloat != 0
+            && mFormatFlags & kAudioFormatFlagIsPacked != 0
+            && mFormatFlags & kAudioFormatFlagIsBigEndian == 0
             && mBitsPerChannel == 32
+            && channels > 0 && channels <= 64
+            && mBytesPerFrame == channels * 4
+            && mFramesPerPacket == 1 && mBytesPerPacket == mBytesPerFrame
+            && mSampleRate.isFinite && mSampleRate > 0
     }
 }
 

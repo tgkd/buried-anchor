@@ -106,6 +106,8 @@ struct MixerPanel: View {
         }
         .padding(12)
         .frame(width: 380)
+        .onAppear { model.setMetering(true) }
+        .onDisappear { model.setMetering(false) }
     }
 
     private var header: some View {
@@ -216,6 +218,12 @@ struct AppRow: View {
                     .font(.callout)
                     .lineLimit(1)
                     .foregroundStyle(row.isPlaying ? .primary : .secondary)
+                if row.controlState.needsAttention {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                        .help(row.controlState.notice ?? "Volume has not been applied")
+                        .accessibilityLabel(row.controlState.notice ?? "Volume has not been applied")
+                }
                 WaveformIndicator(
                     isPlaying: row.isPlaying,
                     level: row.level,
@@ -236,8 +244,11 @@ struct AppRow: View {
             .font(.caption)
             .foregroundStyle(isMuted ? Color.orange : Color.secondary)
             .help(isMuted ? "Unmute" : "Mute")
+            .accessibilityLabel("\(isMuted ? "Unmute" : "Mute") \(row.name)")
 
             Slider(value: percentBinding, in: 0...150)
+                .accessibilityLabel("\(row.name) volume")
+                .accessibilityValue("\(Int(row.percent)) percent requested")
                 .frame(height: rowHeight)
                 .simultaneousGesture(
                     TapGesture(count: 2).onEnded { model.setPercent(100, for: row.id) }
@@ -255,7 +266,7 @@ struct AppRow: View {
             Button(isMuted ? "Unmute" : "Mute") { model.toggleMute(row.id) }
             Divider()
             Button("Reset to 100% and stop controlling") { model.reset(row.id) }
-                .disabled(!row.isControlled)
+                .disabled(!row.isControlled && model.savedPercent(for: row.id) == nil)
         }
     }
 

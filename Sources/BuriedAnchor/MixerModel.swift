@@ -16,6 +16,7 @@ final class MixerModel {
         var level: Float
         var isControlled: Bool
         var isActive: Bool
+        var controlState: SourceControlState = .bypassed
     }
 
     private(set) var rows: [Row] = []
@@ -29,7 +30,7 @@ final class MixerModel {
     var softClip: Bool {
         didSet {
             UserDefaults.standard.set(softClip, forKey: Self.softClipKey)
-            engine.renderer.setSoftClip(softClip)
+            engine.setSoftClip(softClip)
         }
     }
 
@@ -49,7 +50,10 @@ final class MixerModel {
     private var objectBaseline = false
     private var reconcilePending = false
     private var tick = 0
-    private var idleSince: Date?
+    private var discoveryGeneration = 0
+    private var engineGeneration = 0
+    private var wakeObserver: NSObjectProtocol?
+    private var isMetering = false
     private var started = false
     private var presentation: [SourceID: Presentation] = [:]
     private var lastPlaying: [SourceID: Date] = [:]
@@ -57,7 +61,6 @@ final class MixerModel {
     private var liveKeys: Set<SourceID> = []
     private var playingKeys: Set<SourceID> = []
 
-    private let suspendAfter: TimeInterval = 1.5
     private let meterFloor: Float = 0.0002
     private let lingerInterval: TimeInterval = 300
     private let tapRetention: TimeInterval = 300
@@ -82,15 +85,19 @@ final class MixerModel {
         guard !started else { return }
         started = true
         permission = AudioCapturePermission.probe()
-        engine.renderer.setSoftClip(softClip)
+        engine.onUpdate = { [weak self] in self?.refreshControlState() }
         engine.start()
-        outputDeviceName = engine.outputDeviceName
-        processListListener = PropertyListener(
-            systemObject,
-            propertyAddress(kAudioHardwarePropertyProcessObjectList)
-        ) { [weak self] in
-            Task { @MainActor in self?.handleProcessListChange() }
+        engine.setSoftClip(softClip)
+        installDiscoveryListener()
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.engine.wake()
+                self?.refreshList()
+            }
         }
+        isMetering = SelfTest.isRequested
         refreshList()
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.onTick() }
@@ -102,12 +109,16 @@ final class MixerModel {
         timer = nil
         processListListener = nil
         activityListeners.removeAll()
+        if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
+        wakeObserver = nil
+        engine.onUpdate = nil
         engine.shutdown()
     }
 
     func savedPercent(for id: SourceID) -> Double? { percents[id] }
 
     func setPercent(_ value: Double, for id: SourceID) {
+        guard value.isFinite else { return }
         let clamped = min(max(value, 0), 150).rounded()
         percents[id] = clamped
         persist(percents, forKey: Self.defaultsKey)
@@ -123,7 +134,6 @@ final class MixerModel {
         rows[index].isControlled = engine.isControlled(id)
         rows[index].isActive = engine.isActive(id)
         engineError = engine.lastError
-        idleSince = nil
         updateSuspension()
     }
 
@@ -187,6 +197,7 @@ final class MixerModel {
         for (raw, value) in stored where value.isFinite {
             let id = SourceID(raw: raw)
             guard id.isDurable else { continue }
+            if case .executable(let path) = id, !path.hasPrefix("/") { continue }
             result[id] = min(max(value, 0), 150).rounded()
         }
         return result
@@ -232,25 +243,54 @@ final class MixerModel {
     }
 
     private func updateSuspension() {
-        let keys = engine.controlledKeys
-        guard !keys.isEmpty else {
-            idleSince = nil
-            return
+        engine.updateActivity(playingKeys)
+    }
+
+    func setMetering(_ visible: Bool) { isMetering = visible || SelfTest.isRequested }
+
+    private func installDiscoveryListener() {
+        processListListener = nil
+        let generation = discoveryGeneration
+        processListListener = PropertyListener(systemObject, propertyAddress(kAudioHardwarePropertyProcessObjectList)) { [weak self] in
+            Task { @MainActor in
+                guard let self, self.discoveryGeneration == generation else { return }
+                self.handleProcessListChange()
+            }
         }
-        let rendering = keys.contains { key in
-            let gain = engine.gain(for: key)
-            return gain != 0 && gain != 1 && playingKeys.contains(key)
+    }
+
+    private func controlState(for key: SourceID, percent: Double) -> SourceControlState {
+        if percent != 100 && !permission.isGranted {
+            return .failed("System audio permission is required to apply this volume")
         }
-        guard !rendering else {
-            idleSince = nil
-            engine.resume()
-            return
+        if Float(percent / 100) != engine.gain(for: key) { return .waiting }
+        let state = engine.controlState(key)
+        return percent != 100 && state == .bypassed ? .waiting : state
+    }
+
+    private func refreshControlState() {
+        if engineGeneration != engine.generation {
+            engineGeneration = engine.generation
+            discoveryGeneration += 1
+            activityListeners.removeAll()
+            objectOwners.removeAll()
+            objectBaseline = false
+            registry.reset()
+            installDiscoveryListener()
+            refreshList()
         }
-        let now = Date()
-        let since = idleSince ?? now
-        idleSince = since
-        guard now.timeIntervalSince(since) >= suspendAfter else { return }
-        engine.suspend()
+        for index in rows.indices {
+            let key = rows[index].id
+            let controlled = engine.isControlled(key)
+            let active = engine.isActive(key)
+            let state = controlState(for: key, percent: rows[index].percent)
+            if rows[index].isControlled != controlled { rows[index].isControlled = controlled }
+            if rows[index].isActive != active { rows[index].isActive = active }
+            if !active && rows[index].level != 0 { rows[index].level = 0 }
+            if rows[index].controlState != state { rows[index].controlState = state }
+        }
+        if engineError != engine.lastError { engineError = engine.lastError }
+        if outputDeviceName != engine.outputDeviceName { outputDeviceName = engine.outputDeviceName }
     }
 
     private func scheduleReconcile() {
@@ -264,13 +304,17 @@ final class MixerModel {
 
     private func syncActivityListeners() {
         let objectIDs = registry.objectIDs
+        let generation = discoveryGeneration
         for objectID in activityListeners.keys where !objectIDs.contains(objectID) {
             activityListeners.removeValue(forKey: objectID)
         }
         for objectID in objectIDs where activityListeners[objectID] == nil {
             activityListeners[objectID] = Self.activitySelectors.compactMap { selector in
                 PropertyListener(objectID, propertyAddress(selector)) { [weak self] in
-                    Task { @MainActor in self?.handleActivityChange() }
+                    Task { @MainActor in
+                        guard let self, self.discoveryGeneration == generation else { return }
+                        self.handleActivityChange()
+                    }
                 }
             }
         }
@@ -294,7 +338,6 @@ final class MixerModel {
             engine.syncObjectIDs(live.filter { objectOwners[$0] == key }.sorted(), for: key)
         }
         guard waking else { return }
-        idleSince = nil
         engine.resume()
     }
 
@@ -326,14 +369,11 @@ final class MixerModel {
 
     private func onTick() {
         tick += 1
-        engine.retryIfDue()
         if tick % 10 == 0 {
             refreshList()
             registry.forgetTerminated()
         }
-        refreshMeters()
-        pulsePlayback()
-        updateSuspension()
+        if isMetering { refreshMeters() }
         if outputDeviceName != engine.outputDeviceName {
             outputDeviceName = engine.outputDeviceName
         }
@@ -356,7 +396,6 @@ final class MixerModel {
         objectBaseline = true
         objectOwners = owners
         if appeared.contains(where: { owners[$0].map(isManaged) ?? false }) {
-            idleSince = nil
             engine.resume()
         }
 
@@ -397,7 +436,7 @@ final class MixerModel {
         }
 
         let known = Set(next.map(\.id))
-        let absent = Set(engine.controlledKeys).union(
+        let absent = Set(engine.controlledKeys).union(percents.filter { $0.value != 100 }.keys).union(
             lastPlaying.filter { now.timeIntervalSince($0.value) < lingerInterval }.keys
         ).subtracting(known)
         for key in absent {
@@ -426,6 +465,7 @@ final class MixerModel {
             liveKeys.contains($0.key) || lastPlaying[$0.key] != nil
                 || percents[$0.key] != nil || engine.isControlled($0.key)
         }
+        for index in next.indices { next[index].controlState = controlState(for: next[index].id, percent: next[index].percent) }
         rows = next
         sweepRetention(now)
         engineError = engine.lastError
@@ -457,15 +497,19 @@ final class MixerModel {
             if clipping { clipping = false }
             return
         }
-        for (slot, key) in keys.enumerated() {
-            let peak = engine.renderer.takePeak(slot: slot)
+        for key in keys {
+            let peak = engine.takePeak(for: key)
             guard let index = rows.firstIndex(where: { $0.id == key }) else { continue }
+            guard rows[index].isActive else {
+                if rows[index].level != 0 { rows[index].level = 0 }
+                continue
+            }
             var next = max(peak, rows[index].level * 0.7)
             if next < meterFloor { next = 0 }
             guard next != rows[index].level else { continue }
             rows[index].level = next
         }
-        let isClipping = engine.renderer.takeClipCount() > 0
+        let isClipping = engine.takeClip()
         if isClipping != clipping { clipping = isClipping }
     }
 }

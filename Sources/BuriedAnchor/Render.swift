@@ -16,6 +16,7 @@ final class MixRenderer: @unchecked Sendable {
     private let slotInputBuffer: UnsafeMutablePointer<Int32>
     private let slotChannels: UnsafeMutablePointer<Int32>
     private let slotTargets: UnsafeMutablePointer<Int32>
+    private let slotScale: UnsafeMutablePointer<Float>
     private let outputBuffer: UnsafeMutablePointer<Int32>
     private let outputOffset: UnsafeMutablePointer<Int32>
     private let outputStride: UnsafeMutablePointer<Int32>
@@ -25,6 +26,7 @@ final class MixRenderer: @unchecked Sendable {
     private let outputChannelCount = Atomic<Int32>(0)
     private let softClip = Atomic<Bool>(false)
     private let coefficient = Atomic<Float>(0.3)
+    private let layoutFault = Atomic<Bool>(false)
 
     init() {
         targets = .allocate(capacity: Self.maxSlots)
@@ -33,6 +35,8 @@ final class MixRenderer: @unchecked Sendable {
         slotInputBuffer = .allocate(capacity: Self.maxSlots)
         slotChannels = .allocate(capacity: Self.maxSlots)
         slotTargets = .allocate(capacity: Self.maxSlots * Self.maxTapChannels)
+        slotScale = .allocate(capacity: Self.maxSlots)
+        slotScale.initialize(repeating: 1, count: Self.maxSlots)
         outputBuffer = .allocate(capacity: Self.maxOutputChannels)
         outputOffset = .allocate(capacity: Self.maxOutputChannels)
         outputStride = .allocate(capacity: Self.maxOutputChannels)
@@ -59,6 +63,7 @@ final class MixRenderer: @unchecked Sendable {
         slotInputBuffer.deallocate()
         slotChannels.deallocate()
         slotTargets.deallocate()
+        slotScale.deallocate()
         outputBuffer.deallocate()
         outputOffset.deallocate()
         outputStride.deallocate()
@@ -71,12 +76,14 @@ final class MixRenderer: @unchecked Sendable {
     }
 
     func apply(_ layout: GraphLayout, gains: [Float]) {
+        layoutFault.store(false, ordering: .relaxed)
         activeSlots.store(0, ordering: .releasing)
         let slots = min(layout.slots.count, Self.maxSlots)
         for slot in 0..<slots {
             let source = layout.slots[slot]
             slotInputBuffer[slot] = Int32(source.inputBuffer)
             slotChannels[slot] = Int32(source.channels)
+            slotScale[slot] = source.scale
             for channel in 0..<Self.maxTapChannels {
                 let target = channel < source.targets.count ? source.targets[channel] : -1
                 slotTargets[slot * Self.maxTapChannels + channel] = Int32(target)
@@ -103,7 +110,7 @@ final class MixRenderer: @unchecked Sendable {
     }
 
     func setGain(_ gain: Float, slot: Int) {
-        guard slot >= 0, slot < Self.maxSlots else { return }
+        guard gain.isFinite, gain >= 0, slot >= 0, slot < Self.maxSlots else { return }
         targets[slot].store(gain, ordering: .relaxed)
     }
 
@@ -122,6 +129,10 @@ final class MixRenderer: @unchecked Sendable {
 
     func takeOutputPeak() -> Float {
         outputPeak.exchange(0, ordering: .relaxed)
+    }
+
+    func takeLayoutFault() -> Bool {
+        layoutFault.exchange(false, ordering: .relaxed)
     }
 
     func render(
@@ -145,6 +156,23 @@ final class MixRenderer: @unchecked Sendable {
         guard slots > 0, channelCount > 0 else { return }
 
         let inputs = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+        for channel in 0..<channelCount {
+            let buffer = Int(outputBuffer[channel])
+            guard buffer >= 0, buffer < outputs.count,
+                  Int(outputs[buffer].mNumberChannels) == Int(outputStride[channel]),
+                  Int(outputOffset[channel]) < Int(outputStride[channel]) else {
+                layoutFault.store(true, ordering: .relaxed)
+                return
+            }
+        }
+        for slot in 0..<slots {
+            let buffer = Int(slotInputBuffer[slot])
+            guard buffer >= 0, buffer < inputs.count,
+                  Int(inputs[buffer].mNumberChannels) == Int(slotChannels[slot]) else {
+                layoutFault.store(true, ordering: .relaxed)
+                return
+            }
+        }
         let ramp = coefficient.load(ordering: .relaxed)
 
         for slot in 0..<slots {
@@ -173,8 +201,8 @@ final class MixRenderer: @unchecked Sendable {
                 guard destination >= 0, destination < outputs.count,
                       let base = outputs[destination].mData?.assumingMemoryBound(to: Float.self)
                 else { continue }
-                var start = from
-                var step = increment
+                var start = from * slotScale[slot]
+                var step = increment * slotScale[slot]
                 vDSP_vrampmuladd(
                     source + channel, vDSP_Stride(channels),
                     &start, &step,

@@ -120,7 +120,7 @@ final class ProcessRegistry {
         guard process.isRunningOutput else { return nil }
 
         if let executable = executableName(of: process.pid) {
-            return (.executable(executable), executable, nil)
+            return (.executable(executable), URL(fileURLWithPath: executable).lastPathComponent, nil)
         }
         if let bundleID = process.bundleID {
             let key = SourceID.bundle(bundleID)
@@ -164,7 +164,16 @@ final class ProcessRegistry {
     }
 
     private func executableName(of pid: pid_t) -> String? {
-        processInfo(of: pid)?.name
+        var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let count = proc_pidpath(pid, &path, UInt32(path.count))
+        guard count > 0 else { return nil }
+        return String(decoding: path.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    func reset() {
+        ownerCache.removeAll()
+        appCache.removeAll()
+        objectIDs.removeAll()
     }
 
     func forgetTerminated() {

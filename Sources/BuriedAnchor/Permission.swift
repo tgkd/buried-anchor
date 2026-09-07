@@ -20,7 +20,8 @@ enum AudioCapturePermission {
 
         var tapID = AudioObjectID(kAudioObjectUnknown)
         let createStatus = AudioHardwareCreateProcessTap(description, &tapID)
-        guard createStatus == noErr else { return .unknown(createStatus) }
+        if createStatus == kAudioDevicePermissionsError { return .denied }
+        guard createStatus == noErr, tapID != kAudioObjectUnknown else { return .unknown(createStatus) }
         defer { AudioHardwareDestroyProcessTap(tapID) }
 
         var address = propertyAddress(kAudioTapPropertyDescription)

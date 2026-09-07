@@ -69,10 +69,11 @@ struct SettingsView: View {
             }
 
             Section {
-                Toggle("Soft clip", isOn: softClipBinding)
+                Toggle("Soft saturation", isOn: softClipBinding)
                 Text(
-                    "Above 100% the mix can exceed full scale. Off, peaks are clipped flat at ±1.0; "
-                        + "on, they are rounded off with tanh saturation."
+                    "Soft saturation rounds off the controlled mix above 70% of full scale, "
+                        + "including signals below clipping. Off, peaks are clipped at full scale. "
+                        + "This affects controlled apps only."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)

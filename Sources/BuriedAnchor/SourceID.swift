@@ -35,7 +35,7 @@ enum SourceID: Hashable, Sendable {
         switch self {
         case .bundle(let identifier):
             identifier.split(separator: ".").last.map(String.init) ?? identifier
-        case .executable(let name): name
+        case .executable(let name): URL(fileURLWithPath: name).lastPathComponent
         case .ephemeral(let pid): "PID \(pid)"
         }
     }

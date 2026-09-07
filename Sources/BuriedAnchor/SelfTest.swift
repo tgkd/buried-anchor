@@ -43,6 +43,7 @@ enum SelfTest {
             model.setPercent(100, for: target.id)
             let b = await measure(model, id: target.id, seconds: 3, settle: 2.5)
             note("B 100%: peak=\(fmt(b)) controlled=\(isControlled(model, target.id))")
+            expect(!isControlled(model, target.id), "unity releases capture", "unity still captured")
 
             model.setPercent(50, for: target.id)
             let c = await measure(model, id: target.id, seconds: 3, settle: 1.2)
@@ -50,7 +51,7 @@ enum SelfTest {
 
             expect(b < a * 0.2, "suspended at 100%", "still rendering at 100%: \(fmt(b))")
             expect(c > a * 0.7, "resumed at 50%", "did not resume: A=\(fmt(a)) C=\(fmt(c))")
-            expect(isControlled(model, target.id), "tap kept across the cycle", "tap was released")
+            expect(isControlled(model, target.id), "capture restored after unity bypass", "capture was not restored")
 
             restore(model, target.id, saved)
             finish(model)
@@ -145,6 +146,7 @@ enum SelfTest {
         note("=== render ===")
         checkLayoutResolution()
         checkRendering()
+        CoordinatorChecks.run { condition, name in expect(condition, name, name) }
         finish(nil)
     }
 
@@ -174,7 +176,7 @@ enum SelfTest {
         }
 
         switch GraphLayout.resolve(
-            taps: [a, b], input: layout([1, 2, 2]), output: layout([2])
+            taps: [a, b], input: layout([1, 2, 2]), output: layout([2]), inputPrefix: [1]
         ) {
         case .failure(let fault):
             fail("duplex input rejected: \(fault)")
@@ -232,13 +234,19 @@ enum SelfTest {
             GraphLayout.resolve(taps: [a, b], input: layout([2]), output: layout([2])),
             .tapStreamsNotFound(input: [2], taps: [2, 2])
         )
-        expectFault(
-            GraphLayout.resolve(
-                taps: [a, TapFormat(key: .bundle("b"), channels: 2, sampleRate: 44100, isFloat32: true)],
-                input: layout([2, 2]), output: layout([2])
-            ),
-            .tapSampleRateMismatch([48000, 44100])
+        let resampled = GraphLayout.resolve(
+            taps: [a, TapFormat(key: .bundle("b"), channels: 2, sampleRate: 44100, isFloat32: true)],
+            input: layout([2, 2]), output: layout([2])
         )
+        if case .success = resampled { expect(true, "HAL-converted taps use aggregate rate", "") }
+        else { fail("valid aggregate conversion rejected") }
+        expectFault(GraphLayout.resolve(taps: [a], input: layout([2]),
+            output: BufferLayout(bufferChannels: [2], isFloat32: true, sampleRate: 44100)),
+            .aggregateSampleRateMismatch(input: 48000, output: 44100))
+        expectFault(GraphLayout.resolve(taps: [a], input: layout([2, 2]), output: layout([2])),
+                    .tapStreamsNotFound(input: [2, 2], taps: [2]))
+        expectFault(GraphLayout.resolve(taps: [a], input: layout([2]), output: layout([8]), stereoChannels: [8, 9]),
+                    .invalidStereoChannels)
         expectFault(
             GraphLayout.resolve(
                 taps: [TapFormat(key: .bundle("a"), channels: 6, sampleRate: 48000, isFloat32: true)],
@@ -250,6 +258,12 @@ enum SelfTest {
 
     private static func checkRendering() {
         let frames = 64
+        renderCase("normalized mono fold", input: [2], output: [1], gains: [1]) { input in
+            input.fill(0) { _ in 0.25 }
+        } verify: { output in
+            expect(abs(output.sample(0, 0) - 0.25) < 0.0001,
+                   "duplicated mono preserves unity", "mono fold changes level")
+        }
 
         renderCase("interleaved stereo at 200%", input: [2], output: [2], gains: [2]) { input in
             input.fill(0) { _ in 0.25 }
@@ -315,6 +329,33 @@ enum SelfTest {
                 "got \(output.sample(0, 0))"
             )
         }
+
+        let selected = try! GraphLayout.resolve(taps: [tap("selected")], input: layout([2]),
+                                                output: layout([8]), stereoChannels: [2, 3]).get()
+        let renderer = MixRenderer()
+        renderer.apply(selected, gains: [1])
+        let source = SyntheticBuffers([2], frames: 64)
+        source.fill(0) { _ in 0.25 }
+        let wide = SyntheticBuffers([8], frames: 64)
+        renderer.render(input: source.list.unsafePointer, output: wide.list.unsafeMutablePointer)
+        expect(wide.sample(0, 0) == 0 && wide.sample(0, 2) == 0.25 && wide.sample(0, 3) == 0.25,
+               "explicit stereo pair selects its physical channels", "incorrect stereo pair")
+        let changed = SyntheticBuffers([1], frames: 64, prefill: 9)
+        renderer.render(input: source.list.unsafePointer, output: changed.list.unsafeMutablePointer)
+        expect(renderer.takeLayoutFault() && changed.sample(0, 0) == 0,
+               "changed output shape is silenced before stale-stride writes", "unsafe output shape accepted")
+
+        let stereo = try! GraphLayout.resolve(taps: [tap("ramp")], input: layout([2]), output: layout([2])).get()
+        renderer.apply(stereo, gains: [0])
+        renderer.configure(sampleRate: 48000, framesPerBuffer: 64)
+        renderer.setGain(1, slot: 0)
+        let ramped = SyntheticBuffers([2], frames: 64)
+        renderer.render(input: source.list.unsafePointer, output: ramped.list.unsafeMutablePointer)
+        let last = ramped.sample(0, 126)
+        expect(ramped.sample(0, 0) == 0 && last > 0 && last < 0.25,
+               "gain changes ramp without a full-scale step", "gain ramp is discontinuous")
+        renderer.render(input: source.list.unsafePointer, output: ramped.list.unsafeMutablePointer)
+        expect(ramped.sample(0, 0) >= last, "gain ramp continues across buffers", "gain ramp resets at buffer boundary")
     }
 
     private static func renderCase(
@@ -333,7 +374,8 @@ enum SelfTest {
             )
         }
         let resolved = GraphLayout.resolve(
-            taps: taps, input: layout(channels), output: layout(outputChannels)
+            taps: taps, input: layout(channels), output: layout(outputChannels),
+            inputPrefix: Array(channels.dropLast(gains.count))
         )
         guard case .success(let graph) = resolved else {
             fail("\(name): layout rejected \(resolved)")
