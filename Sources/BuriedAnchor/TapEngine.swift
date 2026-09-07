@@ -137,15 +137,16 @@ private final class AudioControlLoop: @unchecked Sendable {
         let epoch = listenerEpoch
         graphListeners.removeAll()
         func listen(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
-                    _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) {
+                    _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
+                    _ react: @escaping @Sendable (AudioCoordinator) -> Void = { $0.graphChanged() }) {
             if let listener = PropertyListener(object, propertyAddress(selector, scope), queue: queue, handler: { [weak self] in
                 guard let self, self.started, self.listenerEpoch == epoch else { return }
-                self.coordinator.invalidate()
+                react(self.coordinator)
                 self.scheduleFlush()
             }) { graphListeners.append(listener) }
         }
         for process in Set(coordinator.requests.values.flatMap(\.members)) {
-            listen(process, kAudioProcessPropertyDevices, kAudioObjectPropertyScopeOutput)
+            listen(process, kAudioProcessPropertyDevices, kAudioObjectPropertyScopeOutput) { $0.memberRoutesChanged() }
         }
         if let route = coordinator.route {
             listen(route.id, kAudioDevicePropertyDeviceIsAlive)

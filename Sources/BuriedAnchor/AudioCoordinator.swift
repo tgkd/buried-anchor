@@ -123,6 +123,30 @@ final class AudioCoordinator: @unchecked Sendable {
 
     func invalidate() { dirty = true }
 
+    func graphChanged() {
+        if lastError == nil { dirty = true }
+    }
+
+    func memberRoutesChanged() {
+        guard let route, lastError == nil else { return }
+        for (key, request) in requests where request.gain != 1 && !request.members.isEmpty {
+            let supported = routeRestriction(request, output: route) == nil
+            if supported != (taps[key] != nil) { dirty = true; return }
+        }
+    }
+
+    private func routeRestriction(_ request: Request, output: OutputRoute) -> SourceControlState? {
+        do {
+            let routes = try request.members.map { try hardware.outputDevices($0) }
+            guard routes.allSatisfy({ $0.isEmpty || Set($0) == [output.id] }) else {
+                return .unsupported("This app is not exclusively using the default output; volume is unchanged")
+            }
+            return nil
+        } catch {
+            return .unsupported("Could not verify this app's output; volume is unchanged")
+        }
+    }
+
     func tick() {
         if renderer.takeLayoutFault() { dirty = true }
         if let retryAt, now() >= retryAt { self.retryAt = nil; dirty = true }
@@ -147,16 +171,11 @@ final class AudioCoordinator: @unchecked Sendable {
             for (key, request) in requests {
                 guard request.gain != 1 else { controls[key] = .bypassed; continue }
                 guard !request.members.isEmpty else { controls[key] = .waiting; continue }
-                do {
-                    let routes = try request.members.map { try hardware.outputDevices($0) }
-                    guard routes.allSatisfy({ !$0.isEmpty && Set($0) == [output.id] }) else {
-                        controls[key] = .unsupported("This app is not exclusively using the default output; volume is unchanged")
-                        continue
-                    }
-                    eligible[key] = request
-                } catch {
-                    controls[key] = .unsupported("Could not verify this app's output; volume is unchanged")
+                if let unsupported = routeRestriction(request, output: output) {
+                    controls[key] = unsupported
+                    continue
                 }
+                eligible[key] = request
             }
 
             for key in sortedTapKeys where eligible[key] == nil {

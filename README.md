@@ -52,6 +52,8 @@ private aggregate; it does not install an audio driver or change a native per-pr
 
 The supported destination is the **default output device with one mono or stereo output stream**.
 An app using another destination or multiple devices is left untouched and marked unsupported.
+An idle app reports no output device at all; it is held by a device-scoped tap on the default
+output and re-verified when its device list changes, without rebuilding the graph.
 Device-and-stream taps restrict capture to the verified destination. A process-wide stereo-mixdown
 tap is unsuitable for that restriction: macOS 27 discarded its `deviceUID` in live readback.
 

@@ -164,6 +164,33 @@ enum CoordinatorChecks {
         do {
             let hardware = FakeAudioHardware()
             let core = AudioCoordinator(hardware: hardware)
+            hardware.routes[11] = []
+            core.setGain(0, key: a, members: [11])
+            core.reconcile()
+            check(core.taps[a]?.route == "output.one" && core.controls[a] == .muted,
+                  "idle process without a device is held by a muted tap")
+            hardware.routes[11] = [1]
+            let builds = hardware.builds
+            let events = hardware.events.count
+            core.memberRoutesChanged()
+            core.reconcile()
+            check(hardware.builds == builds && hardware.events.count == events,
+                  "playback on the default output does not rebuild the graph")
+            hardware.routes[11] = [2]
+            core.memberRoutesChanged()
+            core.reconcile()
+            check(hardware.taps.isEmpty && core.controls[a]?.needsAttention == true,
+                  "playback on another device releases the idle tap")
+            hardware.routes[11] = []
+            core.memberRoutesChanged()
+            core.reconcile()
+            check(core.taps[a] != nil, "returning to idle restores the muted tap")
+            core.shutdown()
+        }
+
+        do {
+            let hardware = FakeAudioHardware()
+            let core = AudioCoordinator(hardware: hardware)
             core.setGain(0.5, key: a, members: [11])
             core.updateActivity([a])
             core.reconcile()

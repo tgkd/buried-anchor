@@ -72,7 +72,8 @@ shared. Debug logs are not reliably retained; errors include actionable recovery
   use .muted until playback resumes. Idle/pre-roll/retry deadlines use system uptime.
 - Supported live route: default output, one mono/stereo stream. Device-and-stream tap descriptions
   are required: macOS 27 ignored deviceUID on a stereoMixdownOfProcesses tap. Verify device, stream,
-  processes, and mute readback. Do not broaden support without real hardware evidence.
+  processes, and mute readback. Do not broaden support without real hardware evidence. An idle
+  process reports an empty device list: treat it as eligible, never as another route.
 - Process restore by bundle ID is disabled because it bypasses live route/ownership validation.
   Fresh process objects must be explicitly included; early process-list events can pre-roll IO.
 - Core Audio service restart increments a generation and discards old IDs/listeners. The facade
