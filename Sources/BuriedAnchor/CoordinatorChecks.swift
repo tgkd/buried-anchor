@@ -185,6 +185,28 @@ enum CoordinatorChecks {
             core.memberRoutesChanged()
             core.reconcile()
             check(core.taps[a] != nil, "returning to idle restores the muted tap")
+            core.syncMembers([], key: a)
+            core.reconcile()
+            check(core.taps[a] == nil && hardware.taps.isEmpty && core.controls[a] == .waiting,
+                  "an app that quit releases its tap and waits")
+            core.shutdown()
+        }
+
+        do {
+            let hardware = FakeAudioHardware()
+            let core = AudioCoordinator(hardware: hardware)
+            hardware.deadMembers = [99]
+            core.setGain(0.5, key: a, members: [11])
+            core.setGain(0, key: b, members: [99])
+            core.updateActivity([a])
+            core.reconcile()
+            check(core.running && core.taps[a] != nil && hardware.hasIO,
+                  "a stale member in one app does not fail the others")
+            check(core.taps[b] == nil && hardware.taps.count == 1 && core.controls[b]?.needsAttention == true
+                  && core.lastError == nil, "the rejected app is released and reported alone")
+            core.syncMembers([12], key: b)
+            core.reconcile()
+            check(core.taps[b] != nil && core.controls[b] == .muted, "fresh members recover the rejected app")
             core.shutdown()
         }
 
@@ -258,6 +280,7 @@ private final class FakeAudioHardware: AudioHardwareBackend {
     var events: [String] = []
     var taps: [AudioObjectID: ManagedTap] = [:]
     var routes: [AudioObjectID: [AudioObjectID]] = [:]
+    var deadMembers: Set<AudioObjectID> = []
     var aggregate: AudioObjectID?
     var hasIO = false
     var builds = 0
@@ -285,6 +308,9 @@ private final class FakeAudioHardware: AudioHardwareBackend {
     func updateTap(_ tap: ManagedTap) throws {
         try hit("updateTap")
         guard taps[tap.id] != nil else { throw AudioFailure(message: "Stale tap") }
+        guard deadMembers.isDisjoint(with: tap.members) else {
+            throw AudioFailure(message: "HAL did not confirm process membership", staleMembership: true)
+        }
         taps[tap.id] = tap
         events.append("mute:\(tap.key.raw):\(behaviorName(tap.behavior))")
     }

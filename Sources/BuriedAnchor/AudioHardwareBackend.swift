@@ -3,6 +3,7 @@ import Foundation
 
 struct AudioFailure: Error, LocalizedError {
     let message: String
+    var staleMembership = false
     var errorDescription: String? { message }
 }
 
@@ -120,7 +121,7 @@ final class CoreAudioBackend: AudioHardwareBackend {
         }
         guard live.stream == tap.stream else { throw AudioFailure(message: "HAL did not confirm the capture stream") }
         guard Set(live.processes) == Set(tap.members) else {
-            throw AudioFailure(message: "HAL did not confirm process membership (requested \(tap.members), returned \(live.processes))")
+            throw AudioFailure(message: "HAL did not confirm process membership (requested \(tap.members), returned \(live.processes))", staleMembership: true)
         }
     }
 

@@ -185,25 +185,34 @@ final class AudioCoordinator: @unchecked Sendable {
             }
             for key in eligible.keys.sorted(by: { $0.raw < $1.raw }) {
                 let request = eligible[key]!
-                if var tap = taps[key] {
-                    tap.members = request.members
-                    tap.route = output.uid
-                    tap.stream = output.stream
-                    tap.behavior = .muted
-                    try hardware.updateTap(tap)
-                    taps[key] = tap
-                } else {
-                    guard taps.count < MixRenderer.maxSlots else {
-                        controls[key] = .failed("The 32-app limit is reached; reset another app to free a slot")
-                        continue
+                do {
+                    if var tap = taps[key] {
+                        tap.members = request.members
+                        tap.route = output.uid
+                        tap.stream = output.stream
+                        tap.behavior = .muted
+                        try hardware.updateTap(tap)
+                        taps[key] = tap
+                    } else {
+                        guard taps.count < MixRenderer.maxSlots else {
+                            controls[key] = .failed("The 32-app limit is reached; reset another app to free a slot")
+                            continue
+                        }
+                        var tap = ManagedTap(id: 0, uuid: UUID(), key: key, members: request.members,
+                                             route: output.uid, behavior: .muted, stream: output.stream)
+                        let id = try hardware.createTap(tap)
+                        tap = ManagedTap(id: id, uuid: tap.uuid, key: key, members: tap.members,
+                                         route: tap.route, behavior: tap.behavior, stream: tap.stream)
+                        taps[key] = tap
+                        try hardware.updateTap(tap)
                     }
-                    var tap = ManagedTap(id: 0, uuid: UUID(), key: key, members: request.members,
-                                         route: output.uid, behavior: .muted, stream: output.stream)
-                    let id = try hardware.createTap(tap)
-                    tap = ManagedTap(id: id, uuid: tap.uuid, key: key, members: tap.members,
-                                     route: tap.route, behavior: tap.behavior, stream: tap.stream)
-                    taps[key] = tap
-                    try hardware.updateTap(tap)
+                } catch let failure as AudioFailure where failure.staleMembership {
+                    if let tap = taps[key] {
+                        try hardware.destroyTap(tap.id)
+                        taps.removeValue(forKey: key)
+                    }
+                    controls[key] = .failed("Volume could not be applied; direct playback restored (\(failure.message))")
+                    log.error("tap for \(key.raw, privacy: .public) rejected: \(failure.message, privacy: .public)")
                 }
             }
             order = sortedTapKeys

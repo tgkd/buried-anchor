@@ -67,6 +67,9 @@ tap is unsuitable for that restriction: macOS 27 discarded its `deviceUID` in li
 - On failure, nonzero sources return to direct playback when that state can be verified. Explicit
   mute is retained when verified. Failed mute/cleanup operations remain visible, and handles stay
   owned for retry. The app never claims bypass merely because graph construction failed.
+- An app that quits has its members cleared within a second, releasing its tap. HAL object IDs
+  are recycled, so a membership readback mismatch destroys only that app's tap and reports it
+  per row; the other apps' graph is built normally.
 - Retries use monotonic 1/2/5/15/30-second deadlines. A Core Audio service reset invalidates taps,
   process IDs, cached ownership, listeners, and queued commands from the old generation; fresh
   discovery reapplies saved settings. Wake and route/format changes trigger reconciliation.

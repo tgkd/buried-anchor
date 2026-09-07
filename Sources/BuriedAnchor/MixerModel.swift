@@ -435,6 +435,10 @@ final class MixerModel {
             )
         }
 
+        for key in engine.controlledKeys where !liveKeys.contains(key) {
+            engine.syncObjectIDs([], for: key)
+        }
+
         let known = Set(next.map(\.id))
         let absent = Set(engine.controlledKeys).union(percents.filter { $0.value != 100 }.keys).union(
             lastPlaying.filter { now.timeIntervalSince($0.value) < lingerInterval }.keys
