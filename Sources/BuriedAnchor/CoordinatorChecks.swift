@@ -201,12 +201,24 @@ enum CoordinatorChecks {
             core.updateActivity([a])
             core.reconcile()
             check(core.running && core.taps[a] != nil && hardware.hasIO,
-                  "a stale member in one app does not fail the others")
-            check(core.taps[b] == nil && hardware.taps.count == 1 && core.controls[b]?.needsAttention == true
-                  && core.lastError == nil, "the rejected app is released and reported alone")
+                  "a dead member in one app does not fail the others")
+            check(core.taps[b] == nil && hardware.taps.count == 1 && core.controls[b] == .waiting
+                  && core.lastError == nil, "an app whose only member died waits without a tap")
             core.syncMembers([12], key: b)
             core.reconcile()
-            check(core.taps[b] != nil && core.controls[b] == .muted, "fresh members recover the rejected app")
+            check(core.taps[b] != nil && core.controls[b] == .muted, "fresh members recover the waiting app")
+            hardware.deadMembers = [12]
+            core.setGain(0.5, key: a, members: [11, 13])
+            core.reconcile()
+            check(core.running && core.taps[a]?.members == [11, 13] && core.taps[b] == nil
+                  && core.controls[b] == .waiting && core.lastError == nil,
+                  "a member dying after capture is pruned by the mute guard")
+            hardware.deadMembers = []
+            hardware.rejectedMembers = [13]
+            core.invalidate()
+            core.reconcile()
+            check(core.taps[a] == nil && core.controls[a]?.needsAttention == true && core.lastError == nil,
+                  "a live process HAL refuses to capture is reported on its row")
             core.shutdown()
         }
 
@@ -281,6 +293,7 @@ private final class FakeAudioHardware: AudioHardwareBackend {
     var taps: [AudioObjectID: ManagedTap] = [:]
     var routes: [AudioObjectID: [AudioObjectID]] = [:]
     var deadMembers: Set<AudioObjectID> = []
+    var rejectedMembers: Set<AudioObjectID> = []
     var aggregate: AudioObjectID?
     var hasIO = false
     var builds = 0
@@ -298,21 +311,22 @@ private final class FakeAudioHardware: AudioHardwareBackend {
         try hit("defaultOutput")
         return OutputRoute(id: 1, uid: "output.one", name: "Test output")
     }
-    func outputDevices(_ process: AudioObjectID) throws -> [AudioObjectID] { routes[process] ?? [1] }
+    func outputDevices(_ process: AudioObjectID) throws -> [AudioObjectID] {
+        guard !deadMembers.contains(process) else { throw AudioFailure(message: "No such process") }
+        return routes[process] ?? [1]
+    }
     func createTap(_ tap: ManagedTap) throws -> AudioObjectID {
         try hit("createTap")
         nextID += 1
         taps[nextID] = tap
         return nextID
     }
-    func updateTap(_ tap: ManagedTap) throws {
+    func updateTap(_ tap: ManagedTap) throws -> [AudioObjectID] {
         try hit("updateTap")
         guard taps[tap.id] != nil else { throw AudioFailure(message: "Stale tap") }
-        guard deadMembers.isDisjoint(with: tap.members) else {
-            throw AudioFailure(message: "HAL did not confirm process membership", staleMembership: true)
-        }
         taps[tap.id] = tap
         events.append("mute:\(tap.key.raw):\(behaviorName(tap.behavior))")
+        return tap.members.filter { !deadMembers.contains($0) && !rejectedMembers.contains($0) }
     }
     func destroyTap(_ id: AudioObjectID) throws {
         try hit("destroyTap")

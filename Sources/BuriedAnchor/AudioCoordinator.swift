@@ -74,13 +74,13 @@ final class AudioCoordinator: @unchecked Sendable {
                 let behavior: CATapMuteBehavior = gain == 0 || !running ? .muted : .mutedWhenTapped
                 if tap.behavior != behavior {
                     tap.behavior = behavior
-                    try hardware.updateTap(tap)
-                    taps[key] = tap
+                    try applyTap(&tap)
                 }
                 if let slot = order.firstIndex(of: key) { renderer.setGain(gain, slot: slot) }
                 controls[key] = gain == 0 ? .muted : (running ? .rendering : .held)
                 updateActivity(playing)
                 return
+            } catch let failure as AudioFailure where failure.staleMembership {
             } catch { recordFailure(error) }
         }
         dirty = true
@@ -130,21 +130,25 @@ final class AudioCoordinator: @unchecked Sendable {
     func memberRoutesChanged() {
         guard let route, lastError == nil else { return }
         for (key, request) in requests where request.gain != 1 && !request.members.isEmpty {
-            let supported = routeRestriction(request, output: route) == nil
+            let routes = inspectRoutes(request, output: route)
+            let supported = routes.supported && !routes.members.isEmpty
             if supported != (taps[key] != nil) { dirty = true; return }
         }
     }
 
-    private func routeRestriction(_ request: Request, output: OutputRoute) -> SourceControlState? {
-        do {
-            let routes = try request.members.map { try hardware.outputDevices($0) }
-            guard routes.allSatisfy({ $0.isEmpty || Set($0) == [output.id] }) else {
-                return .unsupported("This app is not exclusively using the default output; volume is unchanged")
-            }
-            return nil
-        } catch {
-            return .unsupported("Could not verify this app's output; volume is unchanged")
+    private struct RouteInspection {
+        var members: [AudioObjectID]
+        var supported: Bool
+    }
+
+    private func inspectRoutes(_ request: Request, output: OutputRoute) -> RouteInspection {
+        var result = RouteInspection(members: [], supported: true)
+        for member in request.members {
+            guard let devices = try? hardware.outputDevices(member) else { continue }
+            result.members.append(member)
+            if !(devices.isEmpty || Set(devices) == [output.id]) { result.supported = false }
         }
+        return result
     }
 
     func tick() {
@@ -158,9 +162,14 @@ final class AudioCoordinator: @unchecked Sendable {
         guard dirty else { return }
         dirty = false
         var guarded = false
+        var refused: [SourceID: String] = [:]
         do {
             for key in sortedTapKeys {
-                try setBehavior(.muted, key: key)
+                do {
+                    try setBehavior(.muted, key: key)
+                } catch let failure as AudioFailure where failure.staleMembership {
+                    refused[key] = failure.message
+                }
             }
             guarded = true
             try stopGraph()
@@ -170,16 +179,22 @@ final class AudioCoordinator: @unchecked Sendable {
             controls = [:]
             for (key, request) in requests {
                 guard request.gain != 1 else { controls[key] = .bypassed; continue }
-                guard !request.members.isEmpty else { controls[key] = .waiting; continue }
-                if let unsupported = routeRestriction(request, output: output) {
-                    controls[key] = unsupported
+                let routes = inspectRoutes(request, output: output)
+                if routes.members != request.members { requests[key]?.members = routes.members }
+                guard !routes.members.isEmpty else { controls[key] = .waiting; continue }
+                if let reason = refused[key] {
+                    controls[key] = .failed("Volume could not be applied; direct playback restored (\(reason))")
                     continue
                 }
-                eligible[key] = request
+                guard routes.supported else {
+                    controls[key] = .unsupported("This app is not exclusively using the default output; volume is unchanged")
+                    continue
+                }
+                eligible[key] = requests[key]
             }
 
             for key in sortedTapKeys where eligible[key] == nil {
-                try setBehavior(.unmuted, key: key)
+                if refused[key] == nil { try setBehavior(.unmuted, key: key) }
                 try hardware.destroyTap(taps[key]!.id)
                 taps.removeValue(forKey: key)
             }
@@ -191,8 +206,7 @@ final class AudioCoordinator: @unchecked Sendable {
                         tap.route = output.uid
                         tap.stream = output.stream
                         tap.behavior = .muted
-                        try hardware.updateTap(tap)
-                        taps[key] = tap
+                        try applyTap(&tap)
                     } else {
                         guard taps.count < MixRenderer.maxSlots else {
                             controls[key] = .failed("The 32-app limit is reached; reset another app to free a slot")
@@ -204,7 +218,12 @@ final class AudioCoordinator: @unchecked Sendable {
                         tap = ManagedTap(id: id, uuid: tap.uuid, key: key, members: tap.members,
                                          route: tap.route, behavior: tap.behavior, stream: tap.stream)
                         taps[key] = tap
-                        try hardware.updateTap(tap)
+                        try applyTap(&tap)
+                    }
+                    if let tap = taps[key], tap.members.isEmpty {
+                        try hardware.destroyTap(tap.id)
+                        taps.removeValue(forKey: key)
+                        controls[key] = .waiting
                     }
                 } catch let failure as AudioFailure where failure.staleMembership {
                     if let tap = taps[key] {
@@ -250,8 +269,28 @@ final class AudioCoordinator: @unchecked Sendable {
     private func setBehavior(_ behavior: CATapMuteBehavior, key: SourceID) throws {
         guard var tap = taps[key] else { return }
         tap.behavior = behavior
-        try hardware.updateTap(tap)
-        taps[key] = tap
+        try applyTap(&tap)
+    }
+
+    private func applyTap(_ tap: inout ManagedTap) throws {
+        let confirmed = try hardware.updateTap(tap)
+        let requested = Set(tap.members)
+        guard Set(confirmed).isSubset(of: requested) else {
+            throw AudioFailure(message: "HAL did not confirm process membership (requested \(tap.members), returned \(confirmed))", staleMembership: true)
+        }
+        let dropped = requested.subtracting(confirmed)
+        let rejected = dropped.filter { (try? hardware.outputDevices($0)) != nil }
+        guard rejected.isEmpty else {
+            throw AudioFailure(message: "HAL refused to capture process \(rejected.sorted())", staleMembership: true)
+        }
+        if !dropped.isEmpty {
+            tap.members = confirmed.sorted()
+            if var request = requests[tap.key] {
+                request.members = request.members.filter { !dropped.contains($0) }
+                requests[tap.key] = request
+            }
+        }
+        taps[tap.key] = tap
     }
 
     private func recordFailure(_ error: Error) {

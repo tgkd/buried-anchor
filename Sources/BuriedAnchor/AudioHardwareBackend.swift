@@ -28,7 +28,7 @@ protocol AudioHardwareBackend: AnyObject {
     func defaultOutput() throws -> OutputRoute
     func outputDevices(_ process: AudioObjectID) throws -> [AudioObjectID]
     func createTap(_ tap: ManagedTap) throws -> AudioObjectID
-    func updateTap(_ tap: ManagedTap) throws
+    func updateTap(_ tap: ManagedTap) throws -> [AudioObjectID]
     func destroyTap(_ id: AudioObjectID) throws
     func createAggregate(_ route: OutputRoute, taps: [ManagedTap]) throws -> AudioObjectID
     func destroyAggregate(_ id: AudioObjectID) throws
@@ -103,7 +103,7 @@ final class CoreAudioBackend: AudioHardwareBackend {
         return id
     }
 
-    func updateTap(_ tap: ManagedTap) throws {
+    func updateTap(_ tap: ManagedTap) throws -> [AudioObjectID] {
         var address = propertyAddress(kAudioTapPropertyDescription)
         var value: CATapDescription? = description(tap)
         let status = withUnsafePointer(to: &value) {
@@ -120,9 +120,7 @@ final class CoreAudioBackend: AudioHardwareBackend {
             throw AudioFailure(message: "HAL did not confirm the capture device (returned \(live.deviceUID ?? "none"))")
         }
         guard live.stream == tap.stream else { throw AudioFailure(message: "HAL did not confirm the capture stream") }
-        guard Set(live.processes) == Set(tap.members) else {
-            throw AudioFailure(message: "HAL did not confirm process membership (requested \(tap.members), returned \(live.processes))", staleMembership: true)
-        }
+        return live.processes
     }
 
     func destroyTap(_ id: AudioObjectID) throws {
