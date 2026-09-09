@@ -68,7 +68,15 @@ final class AudioCoordinator: @unchecked Sendable {
         let old = requests[key]
         guard old != request else { return }
         requests[key] = request
-        if gain == 0 || gain == 1 || members.isEmpty { prerollUntil.removeValue(forKey: key) }
+        if gain == 1 || request.members.isEmpty {
+            prerollUntil.removeValue(forKey: key)
+        } else if gain == 0 {
+            if old?.members != request.members {
+                prerollUntil[key] = now() + 1.5
+            } else {
+                prerollUntil.removeValue(forKey: key)
+            }
+        }
         if old?.members == request.members, gain != 1, var tap = taps[key], lastError == nil {
             do {
                 let behavior: CATapMuteBehavior = gain == 0 || !running ? .muted : .mutedWhenTapped
@@ -115,7 +123,7 @@ final class AudioCoordinator: @unchecked Sendable {
 
     func preRoll(_ keys: Set<SourceID>) {
         for key in keys {
-            if let request = requests[key], request.gain == 0 || request.gain == 1 { continue }
+            if let request = requests[key], request.gain == 1 || request.members.isEmpty { continue }
             prerollUntil[key] = now() + 1.5
         }
         if !running, lastError == nil { dirty = true }
@@ -128,11 +136,10 @@ final class AudioCoordinator: @unchecked Sendable {
     }
 
     private var wantsIO: Bool {
-        // Silent taps must never acquire the physical output, even briefly. Scope
-        // pre-roll to its source so a muted helper cannot wake another idle app.
-        let audible = requests.filter { key, value in value.gain > 0 && value.gain != 1 && taps[key] != nil }
-        guard !audible.isEmpty else { return false }
-        if audible.contains(where: { key, _ in (prerollUntil[key] ?? 0) > now() || playing.contains(key) }) { return true }
+        let controlled = requests.filter { key, value in value.gain != 1 && taps[key] != nil }
+        guard !controlled.isEmpty else { return false }
+        if controlled.contains(where: { key, _ in (prerollUntil[key] ?? 0) > now() }) { return true }
+        if controlled.contains(where: { key, value in value.gain > 0 && playing.contains(key) }) { return true }
         return running && (idleDeadline.map { now() < $0 } ?? false)
     }
 

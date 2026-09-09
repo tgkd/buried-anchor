@@ -368,7 +368,7 @@ final class MixerModel {
 
     private func needsRendering(_ key: SourceID) -> Bool {
         let percent = percents[key] ?? Double(engine.gain(for: key)) * 100
-        return percent > 0 && percent != 100
+        return percent != 100
     }
 
     private func onTick() {

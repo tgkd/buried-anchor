@@ -67,45 +67,47 @@ enum CoordinatorChecks {
             core.updateActivity([a])
             core.preRoll([a])
             core.tick()
-            check(core.controls[a] == .muted && core.taps[a]?.behavior == .muted
-                  && !hardware.events.contains("startIO") && hardware.builds == 0,
-                  "new zero-percent source stays muted without ever starting output")
+            check(core.running && core.controls[a] == .muted && core.taps[a]?.behavior == .muted
+                  && hardware.events.contains("startIO") && !hardware.events.contains("mute:test.a:mutedWhenTapped"),
+                  "new zero-percent source pre-rolls output while its tap stays muted")
+            time = 1.6
+            core.tick()
+            check(!core.running && core.aggregate == nil && core.taps[a]?.behavior == .muted && core.controls[a] == .muted,
+                  "muted pre-roll releases output after its deadline and keeps the tap")
 
             core.setGain(0.1, key: b, members: [12])
             core.tick()
-            for member: AudioObjectID in [13, 14, 15] {
-                time += 0.1
-                core.syncMembers([11, member], key: a)
-                core.preRoll([a])
-                core.tick()
-            }
-            check(core.taps[a]?.members == [11, 15] && core.taps[a]?.behavior == .muted
-                  && core.controls[b] == .held && !hardware.events.contains("startIO"),
-                  "muted helper churn does not wake output even with another app saved at ten percent")
-            core.invalidate()
+            check(!core.running && core.controls[b] == .held, "a dormant nonzero source does not start output")
+            var events = hardware.events.count
+            core.syncMembers([11, 13], key: a)
             core.tick()
-            check(!core.running && hardware.builds == 0,
-                  "route reconciliation cannot turn muted pre-roll into output")
+            check(core.running && core.taps[a]?.members == [11, 13] && core.taps[a]?.behavior == .muted
+                  && hardware.events.dropFirst(events).contains("startIO"),
+                  "a fresh member of a muted source pre-rolls output so its onset is muted")
+            time = 3.2
+            core.tick()
+            check(!core.running && core.aggregate == nil, "member pre-roll on a muted source also expires")
 
             core.preRoll([b])
             core.tick()
-            check(core.running && hardware.events.contains("startIO"),
-                  "nonzero source discovery still pre-rolls its output")
+            check(core.running && core.controls[b] == .rendering, "nonzero source discovery pre-rolls its output")
             core.setGain(0, key: b, members: [12])
             core.tick()
             check(!core.running && core.aggregate == nil && core.controls[b] == .muted,
                   "muting during pre-roll cancels output without waiting for its deadline")
-            let events = hardware.events.count
-            time = 2
-            core.preRoll([a, b])
+            events = hardware.events.count
+            time = 5
+            core.preRoll([a])
             core.tick()
-            check(!hardware.events.dropFirst(events).contains("startIO"),
-                  "late discovery commands cannot restart a muted graph")
-            core.setGain(0.5, key: a, members: [11, 15])
+            check(hardware.events.dropFirst(events).contains("startIO") && core.controls[a] == .muted,
+                  "a late discovery event on a muted source still primes its tap")
+            time = 6.6
+            core.tick()
+            core.setGain(0.5, key: a, members: [11, 13])
             core.updateActivity([a])
             core.tick()
             core.setGain(0.1, key: b, members: [12])
-            core.setGain(0, key: a, members: [11, 15])
+            core.setGain(0, key: a, members: [11, 13])
             core.tick()
             check(!core.running && core.aggregate == nil && core.controls[b] == .held,
                   "muting the last playing source skips idle delay even with another saved nonzero gain")
@@ -126,8 +128,8 @@ enum CoordinatorChecks {
             core.preRoll([b])
             core.tick()
             check(core.controls[b]?.needsAttention == true && core.controls[a] == .muted
-                  && !hardware.events.contains("startIO"),
-                  "an unsupported source cannot start physical output for muted taps")
+                  && core.order == [a] && core.taps[a]?.behavior == .muted,
+                  "an unsupported source stays out of the graph while a muted source pre-rolls")
             core.shutdown()
         }
 
