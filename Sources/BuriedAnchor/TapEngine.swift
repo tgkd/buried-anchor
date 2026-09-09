@@ -46,7 +46,7 @@ final class TapEngine {
     }
     func release(_ key: SourceID) { release([key]) }
     func release(_ keys: [SourceID]) { command { $0.release(keys) } }
-    func resume() { command { $0.preRoll() } }
+    func preRoll(_ keys: Set<SourceID>) { command { $0.preRoll(keys) } }
     func updateActivity(_ keys: Set<SourceID>) { command { $0.updateActivity(keys) } }
     func wake() { command { $0.invalidate() } }
     func setSoftClip(_ enabled: Bool) { command { $0.renderer.setSoftClip(enabled) } }

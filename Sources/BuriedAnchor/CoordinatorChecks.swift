@@ -20,6 +20,8 @@ enum CoordinatorChecks {
             check(hardware.builds == builds && core.running, "slider changes do not rebuild audio")
             core.setGain(0, key: a, members: [11])
             core.reconcile()
+            check(!core.running && core.aggregate == nil,
+                  "muting the last audible source releases output immediately")
             time = 2
             core.tick()
             check(!core.running && core.aggregate == nil && core.taps[a]?.behavior == .muted,
@@ -40,10 +42,11 @@ enum CoordinatorChecks {
             let hardware = FakeAudioHardware()
             let core = AudioCoordinator(hardware: hardware)
             core.setGain(0, key: a, members: [11])
-            core.updateActivity([a])
+            core.setGain(0.5, key: b, members: [12])
+            core.updateActivity([a, b])
             core.reconcile()
             let start = hardware.events.count
-            core.setGain(0.5, key: b, members: [12])
+            core.syncMembers([12, 13], key: b)
             core.updateActivity([a, b])
             core.reconcile()
             let events = Array(hardware.events.dropFirst(start))
@@ -53,6 +56,78 @@ enum CoordinatorChecks {
                   "muting is verified before graph teardown")
             check(!events.contains("mute:test.a:mutedWhenTapped") && !events.contains("mute:test.a:unmuted"),
                   "adding another source never releases an explicit mute")
+            core.shutdown()
+        }
+
+        do {
+            let hardware = FakeAudioHardware()
+            var time: TimeInterval = 0
+            let core = AudioCoordinator(hardware: hardware, now: { time })
+            core.setGain(0, key: a, members: [11])
+            core.updateActivity([a])
+            core.preRoll([a])
+            core.tick()
+            check(core.controls[a] == .muted && core.taps[a]?.behavior == .muted
+                  && !hardware.events.contains("startIO") && hardware.builds == 0,
+                  "new zero-percent source stays muted without ever starting output")
+
+            core.setGain(0.1, key: b, members: [12])
+            core.tick()
+            for member: AudioObjectID in [13, 14, 15] {
+                time += 0.1
+                core.syncMembers([11, member], key: a)
+                core.preRoll([a])
+                core.tick()
+            }
+            check(core.taps[a]?.members == [11, 15] && core.taps[a]?.behavior == .muted
+                  && core.controls[b] == .held && !hardware.events.contains("startIO"),
+                  "muted helper churn does not wake output even with another app saved at ten percent")
+            core.invalidate()
+            core.tick()
+            check(!core.running && hardware.builds == 0,
+                  "route reconciliation cannot turn muted pre-roll into output")
+
+            core.preRoll([b])
+            core.tick()
+            check(core.running && hardware.events.contains("startIO"),
+                  "nonzero source discovery still pre-rolls its output")
+            core.setGain(0, key: b, members: [12])
+            core.tick()
+            check(!core.running && core.aggregate == nil && core.controls[b] == .muted,
+                  "muting during pre-roll cancels output without waiting for its deadline")
+            let events = hardware.events.count
+            time = 2
+            core.preRoll([a, b])
+            core.tick()
+            check(!hardware.events.dropFirst(events).contains("startIO"),
+                  "late discovery commands cannot restart a muted graph")
+            core.setGain(0.5, key: a, members: [11, 15])
+            core.updateActivity([a])
+            core.tick()
+            core.setGain(0.1, key: b, members: [12])
+            core.setGain(0, key: a, members: [11, 15])
+            core.tick()
+            check(!core.running && core.aggregate == nil && core.controls[b] == .held,
+                  "muting the last playing source skips idle delay even with another saved nonzero gain")
+            core.updateActivity([b])
+            core.tick()
+            check(core.running && core.controls[b] == .rendering && core.controls[a] == .muted,
+                  "unmuting resumes audible playback while the other source stays muted")
+            core.shutdown()
+        }
+
+        do {
+            let hardware = FakeAudioHardware()
+            let core = AudioCoordinator(hardware: hardware)
+            core.setGain(0, key: a, members: [11])
+            hardware.routes[12] = [2]
+            core.setGain(0.5, key: b, members: [12])
+            core.updateActivity([b])
+            core.preRoll([b])
+            core.tick()
+            check(core.controls[b]?.needsAttention == true && core.controls[a] == .muted
+                  && !hardware.events.contains("startIO"),
+                  "an unsupported source cannot start physical output for muted taps")
             core.shutdown()
         }
 

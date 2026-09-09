@@ -329,16 +329,15 @@ final class MixerModel {
         let live = registry.objectIDList()
         let fresh = live.filter { objectOwners[$0] == nil }
         guard !fresh.isEmpty else { return }
-        var waking = false
+        var waking: Set<SourceID> = []
         for objectID in fresh {
             guard let key = registry.owner(of: objectID), isManaged(key) else { continue }
             objectOwners[objectID] = key
-            waking = true
+            if needsRendering(key) { waking.insert(key) }
             guard engine.isControlled(key) else { continue }
             engine.syncObjectIDs(live.filter { objectOwners[$0] == key }.sorted(), for: key)
         }
-        guard waking else { return }
-        engine.resume()
+        if !waking.isEmpty { engine.preRoll(waking) }
     }
 
     private func handleActivityChange() {
@@ -365,6 +364,11 @@ final class MixerModel {
 
     private func isManaged(_ key: SourceID) -> Bool {
         engine.isControlled(key) || (percents[key].map { $0 != 100 } ?? false)
+    }
+
+    private func needsRendering(_ key: SourceID) -> Bool {
+        let percent = percents[key] ?? Double(engine.gain(for: key)) * 100
+        return percent > 0 && percent != 100
     }
 
     private func onTick() {
@@ -395,9 +399,8 @@ final class MixerModel {
         let appeared = objectBaseline ? Set(owners.keys).subtracting(objectOwners.keys) : []
         objectBaseline = true
         objectOwners = owners
-        if appeared.contains(where: { owners[$0].map(isManaged) ?? false }) {
-            engine.resume()
-        }
+        let waking = Set(appeared.compactMap { owners[$0] }.filter(needsRendering))
+        if !waking.isEmpty { engine.preRoll(waking) }
 
         for group in groups {
             presentation[group.id] = Presentation(name: group.name, icon: group.icon)

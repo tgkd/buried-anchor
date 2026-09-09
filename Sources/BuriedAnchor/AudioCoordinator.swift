@@ -51,7 +51,7 @@ final class AudioCoordinator: @unchecked Sendable {
     private(set) var revision = 0
     private var playing: Set<SourceID> = []
     private var idleDeadline: TimeInterval?
-    private var prerollUntil: TimeInterval = 0
+    private var prerollUntil: [SourceID: TimeInterval] = [:]
     private var retryAt: TimeInterval?
     private var retryIndex = 0
     private var layoutSummary = "-"
@@ -68,7 +68,7 @@ final class AudioCoordinator: @unchecked Sendable {
         let old = requests[key]
         guard old != request else { return }
         requests[key] = request
-        if old?.members != request.members, gain == 0, !members.isEmpty { prerollUntil = now() + 1.5 }
+        if gain == 0 || gain == 1 || members.isEmpty { prerollUntil.removeValue(forKey: key) }
         if old?.members == request.members, gain != 1, var tap = taps[key], lastError == nil {
             do {
                 let behavior: CATapMuteBehavior = gain == 0 || !running ? .muted : .mutedWhenTapped
@@ -79,6 +79,8 @@ final class AudioCoordinator: @unchecked Sendable {
                 if let slot = order.firstIndex(of: key) { renderer.setGain(gain, slot: slot) }
                 controls[key] = gain == 0 ? .muted : (running ? .rendering : .held)
                 updateActivity(playing)
+                if gain == 0, !hasAudiblePlayback { idleDeadline = now() }
+                if running && !wantsIO { dirty = true }
                 return
             } catch let failure as AudioFailure where failure.staleMembership {
             } catch { recordFailure(error) }
@@ -95,6 +97,7 @@ final class AudioCoordinator: @unchecked Sendable {
         for key in keys {
             requests.removeValue(forKey: key)
             controls.removeValue(forKey: key)
+            prerollUntil.removeValue(forKey: key)
         }
         dirty = true
     }
@@ -110,14 +113,26 @@ final class AudioCoordinator: @unchecked Sendable {
         }
     }
 
-    func preRoll() {
-        prerollUntil = now() + 1.5
+    func preRoll(_ keys: Set<SourceID>) {
+        for key in keys {
+            if let request = requests[key], request.gain == 0 || request.gain == 1 { continue }
+            prerollUntil[key] = now() + 1.5
+        }
         if !running, lastError == nil { dirty = true }
     }
 
+    private var hasAudiblePlayback: Bool {
+        requests.contains { key, value in
+            value.gain > 0 && value.gain != 1 && taps[key] != nil && playing.contains(key)
+        }
+    }
+
     private var wantsIO: Bool {
-        if prerollUntil > now() { return true }
-        if requests.contains(where: { key, value in value.gain > 0 && value.gain != 1 && playing.contains(key) }) { return true }
+        // Silent taps must never acquire the physical output, even briefly. Scope
+        // pre-roll to its source so a muted helper cannot wake another idle app.
+        let audible = requests.filter { key, value in value.gain > 0 && value.gain != 1 && taps[key] != nil }
+        guard !audible.isEmpty else { return false }
+        if audible.contains(where: { key, _ in (prerollUntil[key] ?? 0) > now() || playing.contains(key) }) { return true }
         return running && (idleDeadline.map { now() < $0 } ?? false)
     }
 
@@ -152,6 +167,7 @@ final class AudioCoordinator: @unchecked Sendable {
     }
 
     func tick() {
+        prerollUntil = prerollUntil.filter { $0.value > now() }
         if renderer.takeLayoutFault() { dirty = true }
         if let retryAt, now() >= retryAt { self.retryAt = nil; dirty = true }
         if running && !wantsIO { dirty = true }
@@ -347,6 +363,8 @@ final class AudioCoordinator: @unchecked Sendable {
         requests.removeAll()
         controls.removeAll()
         playing.removeAll()
+        prerollUntil.removeAll()
+        idleDeadline = nil
         route = nil
         lastError = nil
         retryAt = nil
@@ -357,6 +375,8 @@ final class AudioCoordinator: @unchecked Sendable {
     func shutdown() {
         requests.removeAll()
         playing.removeAll()
+        prerollUntil.removeAll()
+        idleDeadline = nil
         do {
             for key in sortedTapKeys { try setBehavior(.muted, key: key) }
             try stopGraph()

@@ -58,10 +58,13 @@ Device-and-stream taps restrict capture to the verified destination. A process-w
 tap is unsuitable for that restriction: macOS 27 discarded its `deviceUID` in live readback.
 
 - **100% is bypass.** Returning to unity releases the app's tap, even when other apps remain controlled.
-- **0% is explicit mute.** A verified `.muted` tap can hold an app silent without keeping output IO active.
+- **0% is explicit mute.** A verified `.muted` tap holds the mute without starting output IO.
+  Discovering muted helpers never pre-rolls physical output; muting the last rendered source
+  releases output without the idle delay.
 - Nonzero adjusted sources use `.mutedWhenTapped` while rendering. Dormant adjusted sources are held
-  by `.muted`; activity resumes rendering. New members can pre-roll IO for 1.5 seconds, including
-  mute-only sources, to establish capture before a short sound.
+  by `.muted`; activity resumes rendering. New members of nonzero adjusted sources can pre-roll IO
+  for 1.5 seconds to establish capture before a short sound. Pre-roll is scoped to those sources,
+  so a muted helper cannot wake an unrelated idle app's output.
 - Before replacing a graph, the coordinator verifies mute guards, stops and destroys its IOProc,
   destroys the aggregate, reconciles taps, validates the new layout, then starts replacement IO.
 - On failure, nonzero sources return to direct playback when that state can be verified. Explicit
@@ -161,8 +164,10 @@ tap can observe audio before device-path muting and is not necessarily a valid s
   app reports the restriction instead of moving or silently downmixing another route's audio.
 - Adding/removing sources, membership changes, and device reconfiguration rebuild the shared
   graph. Mute guards avoid intentionally opening the original path, but short interruptions remain.
-- First playback after asynchronous process discovery/resume can lose an onset. This is not a
-  sample-accurate interception guarantee; short sounds and Bluetooth transitions need hardware QA.
+- First playback after asynchronous process discovery/resume can lose an onset. Older live testing
+  also found that adding a process to an unread muted tap could leak its onset. Muted helpers now
+  keep physical output closed instead of priming it to work around that behavior. Short-sound mute
+  coverage and Bluetooth transitions need hardware QA; this is not sample-accurate interception.
 - If HAL fails, bypass restores the source's original level, which can be louder than its requested
   attenuation. An unverified mute is reported as a failure, not guaranteed silence.
 - Helper ownership can be ambiguous, especially shared WebKit services. No automatic bundle-only
