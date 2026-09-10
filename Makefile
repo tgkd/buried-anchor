@@ -17,6 +17,8 @@ bundle: build
 	mkdir -p $(APP)/Contents/MacOS
 	cp "$$(swift build -c $(CONFIG) --show-bin-path)/BuriedAnchor" $(APP)/Contents/MacOS/BuriedAnchor
 	cp Resources/Info.plist $(APP)/Contents/Info.plist
+	plutil -insert BuriedAnchorRevision -string "$$(git describe --always --dirty 2>/dev/null || echo unknown)" $(APP)/Contents/Info.plist
+	plutil -insert BuriedAnchorBuildDate -string "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" $(APP)/Contents/Info.plist
 
 sign: bundle
 	@test -n "$(IDENTITY)" || { \

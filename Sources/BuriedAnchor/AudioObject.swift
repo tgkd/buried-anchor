@@ -127,6 +127,7 @@ final class PropertyListener {
         self.block = { _, _ in handler() }
         let status = AudioObjectAddPropertyListenerBlock(objectID, &self.address, queue, block)
         guard status == noErr else {
+            DiagnosticLog.record("hal.listenerFailed", "object=\(objectID) selector=\(fourCC(address.mSelector)) scope=\(fourCC(address.mScope)) status=\(statusName(status))")
             log.error("listener install failed for \(fourCC(address.mSelector), privacy: .public): \(status)")
             return nil
         }

@@ -4,6 +4,8 @@ import Foundation
 import Synchronization
 
 final class MixRenderer: @unchecked Sendable {
+    private let callbacks = Atomic<UInt64>(0)
+    var callbackCount: UInt64 { callbacks.load(ordering: .relaxed) }
     static let maxSlots = 32
     static let maxTapChannels = 2
     static let maxOutputChannels = 64
@@ -139,6 +141,7 @@ final class MixRenderer: @unchecked Sendable {
         input: UnsafePointer<AudioBufferList>,
         output: UnsafeMutablePointer<AudioBufferList>
     ) {
+        callbacks.wrappingAdd(1, ordering: .relaxed)
         let outputs = UnsafeMutableAudioBufferListPointer(output)
         var frameLimit = Int.max
         for index in 0..<outputs.count {

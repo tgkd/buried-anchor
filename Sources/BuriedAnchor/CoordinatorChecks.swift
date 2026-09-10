@@ -133,6 +133,91 @@ enum CoordinatorChecks {
             core.shutdown()
         }
 
+        do {
+            let hardware = FakeAudioHardware()
+            var time: TimeInterval = 0
+            let core = AudioCoordinator(hardware: hardware, now: { time })
+            core.setGain(0, key: a, members: [11])
+            core.tick()
+            time = 2
+            core.tick()
+            let oldTap = core.taps[a]?.id
+            hardware.unavailableOutputs = ["output.one"]
+            hardware.output = OutputRoute(id: 2, uid: "output.two", name: "Replacement")
+            hardware.routes[11] = []
+            core.invalidate(reason: "wake after output disappeared")
+            core.tick()
+            check(core.lastError == nil && core.route?.uid == "output.two"
+                  && core.taps[a]?.route == "output.two" && core.taps[a]?.id != oldTap,
+                  "disconnected output does not trap recovery in its old mute guard")
+            check(core.requests[a]?.gain == 0 && core.controls[a] == .muted && core.running,
+                  "replacement mute preserves intent and primes capture with unchanged idle members")
+            time = 4
+            core.tick()
+            check(!core.running && core.taps[a]?.behavior == .muted && core.lastError == nil,
+                  "replacement pre-roll expires without reopening direct playback")
+            core.shutdown()
+        }
+
+        for operation in ["destroyIO", "destroyAggregate", "destroyTap", "defaultOutput", "startIO"] {
+            let hardware = FakeAudioHardware()
+            var time: TimeInterval = 0
+            let core = AudioCoordinator(hardware: hardware, now: { time })
+            core.setGain(0, key: a, members: [11])
+            core.setGain(0.5, key: b, members: [12])
+            core.updateActivity([b])
+            core.tick()
+            let oldTapIDs = Set(hardware.taps.keys)
+            let builds = hardware.builds
+            hardware.unavailableOutputs = ["output.one"]
+            hardware.output = OutputRoute(id: 2, uid: "output.two", name: "Replacement")
+            hardware.failure = operation
+            hardware.failuresLeft = 100
+            core.invalidate()
+            core.tick()
+            check(core.lastError != nil && core.requests[a]?.gain == 0 && core.requests[b]?.gain == 0.5,
+                  "\(operation) during disconnected-output recovery preserves requested gains")
+            if operation == "destroyIO" {
+                check(core.io != nil && hardware.hasIO && Set(hardware.taps.keys) == oldTapIDs && hardware.builds == builds,
+                      "disconnected-output recovery never forgets a callback that cannot be destroyed")
+            }
+            if operation == "destroyAggregate" || operation == "destroyTap" {
+                check(Set(hardware.taps.keys) == oldTapIDs,
+                      "\(operation) during route recovery retains tap ownership")
+            }
+            hardware.failure = nil
+            core.updateActivity([])
+            time = 40
+            core.tick()
+            check(core.lastError == nil && core.route?.uid == "output.two" && core.running
+                  && core.taps.values.allSatisfy { $0.route == "output.two" }
+                  && Set(hardware.taps.keys).isDisjoint(with: oldTapIDs) && core.controls[a] == .muted,
+                  "\(operation) retry rebuilds and primes replacement taps even after the old deadline")
+            core.shutdown()
+        }
+
+        for uncertain in [false, true] {
+            let hardware = FakeAudioHardware()
+            let core = AudioCoordinator(hardware: hardware)
+            core.setGain(0.5, key: a, members: [11])
+            core.updateActivity([a])
+            core.tick()
+            let oldTapIDs = Set(hardware.taps.keys)
+            hardware.output = OutputRoute(id: 2, uid: "output.two", name: "Replacement")
+            hardware.unknownOutputAvailability = uncertain
+            hardware.failure = "updateTap"
+            hardware.failuresLeft = 100
+            let before = hardware.events.count
+            core.invalidate()
+            core.tick()
+            check(core.io != nil && hardware.hasIO && Set(hardware.taps.keys) == oldTapIDs
+                  && !hardware.events.dropFirst(before).contains("stopIO"),
+                  "a \(uncertain ? "unverifiable" : "still available") old output keeps mute-guard protection")
+            hardware.failure = nil
+            hardware.unknownOutputAvailability = false
+            core.shutdown()
+        }
+
         for operation in ["createTap", "updateTap", "createAggregate", "layout", "createIO", "startIO"] {
             let hardware = FakeAudioHardware()
             let core = AudioCoordinator(hardware: hardware)
@@ -371,6 +456,9 @@ private final class FakeAudioHardware: AudioHardwareBackend {
     var routes: [AudioObjectID: [AudioObjectID]] = [:]
     var deadMembers: Set<AudioObjectID> = []
     var rejectedMembers: Set<AudioObjectID> = []
+    var output = OutputRoute(id: 1, uid: "output.one", name: "Test output")
+    var unavailableOutputs: Set<String> = []
+    var unknownOutputAvailability = false
     var aggregate: AudioObjectID?
     var hasIO = false
     var builds = 0
@@ -386,11 +474,16 @@ private final class FakeAudioHardware: AudioHardwareBackend {
     }
     func defaultOutput() throws -> OutputRoute {
         try hit("defaultOutput")
-        return OutputRoute(id: 1, uid: "output.one", name: "Test output")
+        return output
+    }
+    func outputIsUnavailable(_ uid: String) throws -> Bool {
+        try hit("outputIsUnavailable")
+        if unknownOutputAvailability { throw AudioFailure(message: "Could not read output availability") }
+        return unavailableOutputs.contains(uid)
     }
     func outputDevices(_ process: AudioObjectID) throws -> [AudioObjectID] {
         guard !deadMembers.contains(process) else { throw AudioFailure(message: "No such process") }
-        return routes[process] ?? [1]
+        return routes[process] ?? [output.id]
     }
     func createTap(_ tap: ManagedTap) throws -> AudioObjectID {
         try hit("createTap")
@@ -400,6 +493,9 @@ private final class FakeAudioHardware: AudioHardwareBackend {
     }
     func updateTap(_ tap: ManagedTap) throws -> [AudioObjectID] {
         try hit("updateTap")
+        if unavailableOutputs.contains(tap.route) {
+            throw AudioFailure(message: "HAL did not confirm the capture device (returned none)")
+        }
         guard taps[tap.id] != nil else { throw AudioFailure(message: "Stale tap") }
         taps[tap.id] = tap
         events.append("mute:\(tap.key.raw):\(behaviorName(tap.behavior))")

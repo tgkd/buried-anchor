@@ -26,6 +26,7 @@ struct ManagedTap {
 
 protocol AudioHardwareBackend: AnyObject {
     func defaultOutput() throws -> OutputRoute
+    func outputIsUnavailable(_ uid: String) throws -> Bool
     func outputDevices(_ process: AudioObjectID) throws -> [AudioObjectID]
     func createTap(_ tap: ManagedTap) throws -> AudioObjectID
     func updateTap(_ tap: ManagedTap) throws -> [AudioObjectID]
@@ -44,6 +45,7 @@ final class CoreAudioBackend: AudioHardwareBackend {
     static let aggregatePrefix = "com.buriedanchor.aggregate."
 
     private func check(_ status: OSStatus, _ operation: String, destroying: Bool = false) throws {
+        DiagnosticLog.record("hal.operation", "operation=\(operation) status=\(statusName(status))")
         guard status != noErr, !(destroying && status == kAudioHardwareBadObjectError) else { return }
         throw AudioFailure(message: "\(operation): \(statusName(status))")
     }
@@ -78,6 +80,24 @@ final class CoreAudioBackend: AudioHardwareBackend {
                            stream: UInt(selected.offset))
     }
 
+    func outputIsUnavailable(_ uid: String) throws -> Bool {
+        var address = propertyAddress(kAudioHardwarePropertyDevices)
+        var size: UInt32 = 0
+        try check(AudioObjectGetPropertyDataSize(systemObject, &address, 0, nil, &size), "Read device list size")
+        var devices = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.stride)
+        if !devices.isEmpty {
+            try check(AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, &devices), "Read device list")
+            devices = Array(devices.prefix(Int(size) / MemoryLayout<AudioObjectID>.stride))
+        }
+        guard let device = devices.first(where: { $0.string(propertyAddress(kAudioDevicePropertyDeviceUID)) == uid }) else {
+            DiagnosticLog.record("hal.outputMissing", "device=\(uid) devices=\(devices)")
+            return true
+        }
+        let alive = device.value(propertyAddress(kAudioDevicePropertyDeviceIsAlive), default: UInt32(1)) != 0
+        DiagnosticLog.record("hal.outputPresent", "device=\(uid) id=\(device) alive=\(alive)")
+        return !alive
+    }
+
     func outputDevices(_ process: AudioObjectID) throws -> [AudioObjectID] {
         let address = propertyAddress(kAudioProcessPropertyDevices, kAudioObjectPropertyScopeOutput)
         guard process.dataSize(address) != nil else {
@@ -100,10 +120,12 @@ final class CoreAudioBackend: AudioHardwareBackend {
         var id = AudioObjectID(kAudioObjectUnknown)
         try check(AudioHardwareCreateProcessTap(description(tap), &id), "Create capture tap")
         guard id != kAudioObjectUnknown else { throw AudioFailure(message: "HAL returned an invalid tap") }
+        DiagnosticLog.record("tap.created", "source=\(tap.key.raw) id=\(id) members=\(tap.members) device=\(tap.route) mute=\(behaviorName(tap.behavior))")
         return id
     }
 
     func updateTap(_ tap: ManagedTap) throws -> [AudioObjectID] {
+        DiagnosticLog.record("tap.update", "source=\(tap.key.raw) id=\(tap.id) members=\(tap.members) device=\(tap.route) stream=\(tap.stream) mute=\(behaviorName(tap.behavior))")
         var address = propertyAddress(kAudioTapPropertyDescription)
         var value: CATapDescription? = description(tap)
         let status = withUnsafePointer(to: &value) {
@@ -111,10 +133,8 @@ final class CoreAudioBackend: AudioHardwareBackend {
                                        UInt32(MemoryLayout<CATapDescription?>.size), $0)
         }
         try check(status, "Update capture tap")
-        var raw: Unmanaged<CATapDescription>?
-        var size = UInt32(MemoryLayout<CATapDescription?>.size)
-        try check(AudioObjectGetPropertyData(tap.id, &address, 0, nil, &size, &raw), "Verify capture tap")
-        guard let live = raw?.takeRetainedValue() else { throw AudioFailure(message: "HAL did not return the capture description") }
+        let live = try readTap(tap.id)
+        DiagnosticLog.record("tap.readback", tapSummary(tap.id, live))
         guard live.muteBehavior == tap.behavior else { throw AudioFailure(message: "HAL did not confirm capture mute state") }
         guard live.deviceUID == tap.route else {
             throw AudioFailure(message: "HAL did not confirm the capture device (returned \(live.deviceUID ?? "none"))")
@@ -123,7 +143,40 @@ final class CoreAudioBackend: AudioHardwareBackend {
         return live.processes
     }
 
+    private func readTap(_ id: AudioObjectID) throws -> CATapDescription {
+        var address = propertyAddress(kAudioTapPropertyDescription)
+        var raw: Unmanaged<CATapDescription>?
+        var size = UInt32(MemoryLayout<CATapDescription?>.size)
+        let status = AudioObjectGetPropertyData(id, &address, 0, nil, &size, &raw)
+        if status != noErr { try check(status, "Read capture tap \(id)") }
+        guard let live = raw?.takeRetainedValue() else { throw AudioFailure(message: "HAL did not return the capture description") }
+        return live
+    }
+
+    private func tapSummary(_ id: AudioObjectID, _ live: CATapDescription) -> String {
+        "id=\(id) name=\(live.name) members=\(live.processes) device=\(live.deviceUID ?? "none") stream=\(String(describing: live.stream)) mute=\(behaviorName(live.muteBehavior))"
+    }
+
+    /// Read-only snapshots; no permission probes, tap writes or IO starts.
+    func diagnostics(_ taps: [ManagedTap]) -> [String] {
+        var lines: [String] = []
+        let output = systemObject.value(propertyAddress(kAudioHardwarePropertyDefaultOutputDevice), default: UInt32(0))
+        let effects = systemObject.value(propertyAddress(kAudioHardwarePropertyDefaultSystemOutputDevice), default: UInt32(0))
+        lines.append("defaultOutput=\(output) systemOutput=\(effects) deviceRunning=\(output.value(propertyAddress(kAudioDevicePropertyDeviceIsRunningSomewhere), default: UInt32(0)))")
+        for tap in taps.sorted(by: { $0.key.raw < $1.key.raw }) {
+            do { lines.append(tapSummary(tap.id, try readTap(tap.id))) }
+            catch { lines.append("source=\(tap.key.raw) id=\(tap.id) readError=\(error.localizedDescription)") }
+            for member in tap.members {
+                let devices = try? outputDevices(member)
+                let playing = member.optionalValue(propertyAddress(kAudioProcessPropertyIsRunningOutput), of: UInt32.self)
+                lines.append("source=\(tap.key.raw) member=\(member) devices=\(String(describing: devices)) playing=\(String(describing: playing))")
+            }
+        }
+        return lines
+    }
+
     func destroyTap(_ id: AudioObjectID) throws {
+        DiagnosticLog.record("tap.destroy", "id=\(id)")
         try check(AudioHardwareDestroyProcessTap(id), "Destroy capture tap", destroying: true)
     }
 
@@ -142,6 +195,7 @@ final class CoreAudioBackend: AudioHardwareBackend {
         var id = AudioObjectID(kAudioObjectUnknown)
         try check(AudioHardwareCreateAggregateDevice(composition as CFDictionary, &id), "Create mix device")
         guard id != kAudioObjectUnknown else { throw AudioFailure(message: "HAL returned an invalid aggregate") }
+        DiagnosticLog.record("graph.created", "aggregate=\(id) output=\(route.uid) taps=\(taps.map(\.id))")
         return id
     }
 

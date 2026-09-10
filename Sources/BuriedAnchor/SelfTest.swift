@@ -147,6 +147,7 @@ enum SelfTest {
         checkLayoutResolution()
         checkRendering()
         CoordinatorChecks.run { condition, name in expect(condition, name, name) }
+        DiagnosticLogChecks.run { condition, name in expect(condition, name, name) }
         finish(nil)
     }
 

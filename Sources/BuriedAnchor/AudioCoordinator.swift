@@ -52,6 +52,7 @@ final class AudioCoordinator: @unchecked Sendable {
     private var playing: Set<SourceID> = []
     private var idleDeadline: TimeInterval?
     private var prerollUntil: [SourceID: TimeInterval] = [:]
+    private var pendingPriming: Set<SourceID> = []
     private var retryAt: TimeInterval?
     private var retryIndex = 0
     private var layoutSummary = "-"
@@ -67,6 +68,7 @@ final class AudioCoordinator: @unchecked Sendable {
         let request = Request(gain: gain, members: Array(Set(members)).sorted())
         let old = requests[key]
         guard old != request else { return }
+        DiagnosticLog.record("control.request", "source=\(key.raw) old=\(String(describing: old)) gain=\(gain) members=\(request.members)")
         requests[key] = request
         if gain == 1 || request.members.isEmpty {
             prerollUntil.removeValue(forKey: key)
@@ -102,15 +104,20 @@ final class AudioCoordinator: @unchecked Sendable {
     }
 
     func release(_ keys: [SourceID]) {
+        DiagnosticLog.record("control.release", keys.map(\.raw).sorted().joined(separator: ","))
         for key in keys {
             requests.removeValue(forKey: key)
             controls.removeValue(forKey: key)
             prerollUntil.removeValue(forKey: key)
+            pendingPriming.remove(key)
         }
         dirty = true
     }
 
     func updateActivity(_ keys: Set<SourceID>) {
+        if playing != keys {
+            DiagnosticLog.record("control.activity", "playing=\(keys.map(\.raw).sorted()) running=\(running)")
+        }
         playing = keys
         let needed = requests.contains { key, request in request.gain > 0 && request.gain != 1 && keys.contains(key) }
         if needed {
@@ -122,6 +129,7 @@ final class AudioCoordinator: @unchecked Sendable {
     }
 
     func preRoll(_ keys: Set<SourceID>) {
+        DiagnosticLog.record("control.preroll", "sources=\(keys.map(\.raw).sorted()) until=\(now() + 1.5)")
         for key in keys {
             if let request = requests[key], request.gain == 1 || request.members.isEmpty { continue }
             prerollUntil[key] = now() + 1.5
@@ -143,7 +151,10 @@ final class AudioCoordinator: @unchecked Sendable {
         return running && (idleDeadline.map { now() < $0 } ?? false)
     }
 
-    func invalidate() { dirty = true }
+    func invalidate(reason: String = "external") {
+        DiagnosticLog.record("control.invalidate", reason)
+        dirty = true
+    }
 
     func graphChanged() {
         if lastError == nil { dirty = true }
@@ -174,30 +185,52 @@ final class AudioCoordinator: @unchecked Sendable {
     }
 
     func tick() {
+        let expired = prerollUntil.filter { $0.value <= now() }.keys.map(\.raw).sorted()
+        if !expired.isEmpty { DiagnosticLog.record("control.prerollExpired", "sources=\(expired)") }
         prerollUntil = prerollUntil.filter { $0.value > now() }
-        if renderer.takeLayoutFault() { dirty = true }
-        if let retryAt, now() >= retryAt { self.retryAt = nil; dirty = true }
-        if running && !wantsIO { dirty = true }
+        if renderer.takeLayoutFault() {
+            DiagnosticLog.record("render.layoutFault")
+            dirty = true
+        }
+        if let retryAt, now() >= retryAt {
+            DiagnosticLog.record("control.retry", "attempt=\(retryIndex)")
+            self.retryAt = nil; dirty = true
+        }
+        if running && !wantsIO {
+            DiagnosticLog.record("control.suspend", "no IO demand; playing=\(playing.map(\.raw).sorted())")
+            dirty = true
+        }
         reconcile()
     }
 
     func reconcile() {
         guard dirty else { return }
+        DiagnosticLog.record("graph.reconcile", "generation=\(generation) revision=\(revision) running=\(running) wantsIO=\(wantsIO)")
         dirty = false
         var guarded = false
         var refused: [SourceID: String] = [:]
+        var disconnected: Set<SourceID> = []
         do {
             for key in sortedTapKeys {
                 do {
                     try setBehavior(.muted, key: key)
                 } catch let failure as AudioFailure where failure.staleMembership {
                     refused[key] = failure.message
+                } catch {
+                    guard oldOutputDisappeared(taps[key]!.route, guardError: error) else { throw error }
+                    disconnected.insert(key)
                 }
             }
             guarded = true
             try stopGraph()
             let output = try hardware.defaultOutput()
             route = output
+            for key in disconnected.sorted(by: { $0.raw < $1.raw }) {
+                try hardware.destroyTap(taps[key]!.id)
+                taps.removeValue(forKey: key)
+                pendingPriming.insert(key)
+                DiagnosticLog.record("graph.tapReplaced", "source=\(key.raw) newOutput=\(output.uid)")
+            }
             var eligible: [SourceID: Request] = [:]
             controls = [:]
             for (key, request) in requests {
@@ -258,6 +291,7 @@ final class AudioCoordinator: @unchecked Sendable {
                 }
             }
             order = sortedTapKeys
+            for key in pendingPriming where taps[key] != nil { prerollUntil[key] = now() + 1.5 }
             if !order.isEmpty, wantsIO {
                 let created = try hardware.createAggregate(output, taps: order.compactMap { taps[$0] })
                 aggregate = created
@@ -275,10 +309,12 @@ final class AudioCoordinator: @unchecked Sendable {
             for key in order {
                 controls[key] = requests[key]?.gain == 0 ? .muted : (running ? .rendering : .held)
             }
+            pendingPriming.removeAll()
             lastError = nil
             retryAt = nil
             retryIndex = 0
             revision += 1
+            DiagnosticLog.record("graph.ready", "revision=\(revision) running=\(running) order=\(order.map(\.raw))")
         } catch {
             if guarded {
                 do { try stopGraph() } catch { }
@@ -288,6 +324,17 @@ final class AudioCoordinator: @unchecked Sendable {
     }
 
     private var sortedTapKeys: [SourceID] { taps.keys.sorted { $0.raw < $1.raw } }
+
+    private func oldOutputDisappeared(_ uid: String, guardError: Error) -> Bool {
+        do {
+            let gone = try hardware.outputIsUnavailable(uid)
+            DiagnosticLog.record("graph.muteGuardFailed", "device=\(uid) unavailable=\(gone) error=\(guardError.localizedDescription)")
+            return gone
+        } catch {
+            DiagnosticLog.record("graph.muteGuardFailed", "device=\(uid) unavailable=unknown error=\(guardError.localizedDescription) probe=\(error.localizedDescription)")
+            return false
+        }
+    }
 
     private func setBehavior(_ behavior: CATapMuteBehavior, key: SourceID) throws {
         guard var tap = taps[key] else { return }
@@ -340,6 +387,7 @@ final class AudioCoordinator: @unchecked Sendable {
         retryAt = now() + delays[min(retryIndex, delays.count - 1)]
         retryIndex += 1
         revision += 1
+        DiagnosticLog.record("control.failure", "reason=\(lastError ?? reason) retryAt=\(String(describing: retryAt)) attempt=\(retryIndex)")
         log.error("audio recovery: \(self.lastError ?? reason, privacy: .public)")
     }
 
@@ -359,6 +407,7 @@ final class AudioCoordinator: @unchecked Sendable {
     }
 
     func serviceRestarted() {
+        DiagnosticLog.record("hal.restart", "oldGeneration=\(generation)")
         generation += 1
         revision += 1
         aggregate = nil
@@ -371,6 +420,7 @@ final class AudioCoordinator: @unchecked Sendable {
         controls.removeAll()
         playing.removeAll()
         prerollUntil.removeAll()
+        pendingPriming.removeAll()
         idleDeadline = nil
         route = nil
         lastError = nil
@@ -383,6 +433,7 @@ final class AudioCoordinator: @unchecked Sendable {
         requests.removeAll()
         playing.removeAll()
         prerollUntil.removeAll()
+        pendingPriming.removeAll()
         idleDeadline = nil
         do {
             for key in sortedTapKeys { try setBehavior(.muted, key: key) }
@@ -405,7 +456,12 @@ final class AudioCoordinator: @unchecked Sendable {
 
     func diagnostics() -> [String] {
         ["generation=\(generation) running=\(running) aggregate=\(String(describing: aggregate)) io=\(io != nil)",
-         "output=\(route?.name ?? "-") layout=\(layoutSummary)", "error=\(lastError ?? "none")"]
+         "output=\(route?.name ?? "-") device=\(route?.uid ?? "-") layout=\(layoutSummary)", "error=\(lastError ?? "none")",
+         "playing=\(playing.map(\.raw).sorted()) wantsIO=\(wantsIO) idleDeadline=\(String(describing: idleDeadline)) retryAt=\(String(describing: retryAt))"]
+        + requests.keys.sorted { $0.raw < $1.raw }.map { key in
+            let request = requests[key]!
+            return "request \(key.raw) gain=\(request.gain) members=\(request.members) prerollUntil=\(String(describing: prerollUntil[key])) state=\(String(describing: controls[key]))"
+        }
         + sortedTapKeys.map { key in
             let tap = taps[key]!
             return "tap \(key.raw) id=\(tap.id) members=\(tap.members) route=\(tap.route) mute=\(behaviorName(tap.behavior)) state=\(String(describing: controls[key]))"

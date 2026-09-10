@@ -48,7 +48,7 @@ final class TapEngine {
     func release(_ keys: [SourceID]) { command { $0.release(keys) } }
     func preRoll(_ keys: Set<SourceID>) { command { $0.preRoll(keys) } }
     func updateActivity(_ keys: Set<SourceID>) { command { $0.updateActivity(keys) } }
-    func wake() { command { $0.invalidate() } }
+    func wake() { command { $0.invalidate(reason: "wake") } }
     func setSoftClip(_ enabled: Bool) { command { $0.renderer.setSoftClip(enabled) } }
     func takePeak(for key: SourceID) -> Float { pendingPeaks.removeValue(forKey: key) ?? 0 }
     func takeClip() -> Bool { defer { pendingClip = false }; return pendingClip }
@@ -60,7 +60,8 @@ final class TapEngine {
 
 private final class AudioControlLoop: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.buriedanchor.control", qos: .userInitiated)
-    private let coordinator = AudioCoordinator(hardware: CoreAudioBackend())
+    private let hardware = CoreAudioBackend()
+    private let coordinator: AudioCoordinator
     private let publish: @Sendable (EngineSnapshot) -> Void
     private var timer: DispatchSourceTimer?
     private var systemListeners: [PropertyListener] = []
@@ -69,8 +70,13 @@ private final class AudioControlLoop: @unchecked Sendable {
     private var observedRevision = -1
     private var flushPending = false
     private var started = false
+    private var lastDiagnosticState: [String] = []
+    private var nextHeartbeat: TimeInterval = 0
 
-    init(publish: @escaping @Sendable (EngineSnapshot) -> Void) { self.publish = publish }
+    init(publish: @escaping @Sendable (EngineSnapshot) -> Void) {
+        self.publish = publish
+        coordinator = AudioCoordinator(hardware: hardware)
+    }
 
     func start() {
         queue.async { [self] in
@@ -81,14 +87,17 @@ private final class AudioControlLoop: @unchecked Sendable {
             timer.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(10))
             timer.setEventHandler { [weak self] in self?.flush() }
             self.timer = timer
-            self.coordinator.invalidate()
+            self.coordinator.invalidate(reason: "startup")
             timer.resume()
         }
     }
 
     func submit(generation: Int, _ action: @escaping @Sendable (AudioCoordinator) -> Void) {
         queue.async {
-            guard self.started, self.coordinator.generation == generation else { return }
+            guard self.started, self.coordinator.generation == generation else {
+                DiagnosticLog.record("control.commandDiscarded", "submitted=\(generation) current=\(self.coordinator.generation) started=\(self.started)")
+                return
+            }
             action(self.coordinator)
             self.scheduleFlush()
         }
@@ -112,6 +121,19 @@ private final class AudioControlLoop: @unchecked Sendable {
             installGraphListeners()
         }
         publish(coordinator.snapshot())
+        let state = coordinator.diagnostics()
+        if state != lastDiagnosticState {
+            DiagnosticLog.record("engine.state", state.joined(separator: " | "))
+            lastDiagnosticState = state
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        if now >= nextHeartbeat {
+            nextHeartbeat = now + 30
+            DiagnosticLog.record("engine.heartbeat", "callbacks=\(coordinator.renderer.callbackCount) | " + state.joined(separator: " | "))
+            for line in hardware.diagnostics(Array(coordinator.taps.values)) {
+                DiagnosticLog.record("hal.readback", line)
+            }
+        }
     }
 
     private func installSystemListeners() {
@@ -119,7 +141,7 @@ private final class AudioControlLoop: @unchecked Sendable {
         let generation = coordinator.generation
         let route = PropertyListener(systemObject, propertyAddress(kAudioHardwarePropertyDefaultOutputDevice), queue: queue) { [weak self] in
             guard let self, self.started, self.coordinator.generation == generation else { return }
-            self.coordinator.invalidate()
+            self.coordinator.invalidate(reason: "default output changed")
             self.scheduleFlush()
         }
         let restart = PropertyListener(systemObject, propertyAddress(kAudioHardwarePropertyServiceRestarted), queue: queue) { [weak self] in
@@ -141,6 +163,7 @@ private final class AudioControlLoop: @unchecked Sendable {
                     _ react: @escaping @Sendable (AudioCoordinator) -> Void = { $0.graphChanged() }) {
             if let listener = PropertyListener(object, propertyAddress(selector, scope), queue: queue, handler: { [weak self] in
                 guard let self, self.started, self.listenerEpoch == epoch else { return }
+                DiagnosticLog.record("hal.propertyChanged", "object=\(object) selector=\(fourCC(selector)) scope=\(fourCC(scope))")
                 react(self.coordinator)
                 self.scheduleFlush()
             }) { graphListeners.append(listener) }
@@ -173,6 +196,7 @@ private final class AudioControlLoop: @unchecked Sendable {
             systemListeners.removeAll()
             graphListeners.removeAll()
             coordinator.shutdown()
+            DiagnosticLog.record("engine.stopped", coordinator.diagnostics().joined(separator: " | "))
         }
     }
 

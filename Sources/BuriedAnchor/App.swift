@@ -22,6 +22,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = MixerModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let info = Bundle.main.infoDictionary ?? [:]
+        DiagnosticLog.record("app.start", "path=\(Bundle.main.bundlePath) version=\(info["CFBundleShortVersionString"] ?? "?") build=\(info["CFBundleVersion"] ?? "?") revision=\(info["BuriedAnchorRevision"] ?? "unknown") built=\(info["BuriedAnchorBuildDate"] ?? "unknown") os=\(ProcessInfo.processInfo.operatingSystemVersionString) loginItem=\(LoginItem.statusName) selfTest=\(SelfTest.isRequested)")
         if CommandLine.arguments.contains("--render") {
             SelfTest.runRender()
             return
@@ -59,6 +61,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         model.shutdown()
+        DiagnosticLog.record("app.stop")
+        DiagnosticLog.flush()
     }
 }
 

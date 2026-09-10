@@ -68,6 +68,12 @@ tap is unsuitable for that restriction: macOS 27 discarded its `deviceUID` in li
   source, and only a source that still exists with a non-unity gain can hold IO open.
 - Before replacing a graph, the coordinator verifies mute guards, stops and destroys its IOProc,
   destroys the aggregate, reconciles taps, validates the new layout, then starts replacement IO.
+- A mute guard that fails because the tap's output device disappeared (unplugged or lost across
+  sleep) does not trap recovery: the coordinator confirms the device is absent from the HAL device
+  list, destroys that tap, and recreates it on the current default output. Replacement taps pre-roll
+  IO once, including muted ones, and that priming is repeated on retry until a graph starts. If the
+  old device is still present or its availability cannot be read, the guard failure stands and the
+  old graph is kept.
 - On failure, nonzero sources return to direct playback when that state can be verified. Explicit
   mute is retained when verified. Failed mute/cleanup operations remain visible, and handles stay
   owned for retry. The app never claims bypass merely because graph construction failed.
@@ -117,6 +123,29 @@ provide a measured level. Meter values clear when capture stops.
 Settings include launch at login and optional **Soft saturation**. Saturation begins at 0.7 full
 scale and deliberately changes some unclipped signals. With it disabled, the controlled mix is hard
 clipped at full scale. Neither mode limits unmanaged apps mixed downstream by macOS.
+
+## Diagnostic journal
+
+Normal launches automatically append to `~/Library/Logs/BuriedAnchor/events.jsonl`.
+Each JSON line includes UTC time, monotonic uptime, PID and a launch-session ID. Startup records
+include the actual app path, Git revision, bundle build date, OS and login-item status.
+The journal records saved/requested gains, source membership and playback changes, sleep/wake,
+HAL notifications, tap writes and readback, graph start/stop, pre-roll expiration and recovery.
+Every 30 seconds a heartbeat adds the callback count, coordinator state and read-only HAL tap,
+process-route and activity snapshots. A reported mute is still not proof of physical silence.
+
+Writing runs on a separate bounded queue, never in the audio callback. The callback only increments
+an atomic diagnostic counter. Files rotate at 2 MiB, keeping four archives (`events.1.jsonl` is the
+newest), about 10 MiB total. Overload drops are reported as `log.dropped`. The journal contains app
+identifiers, executable paths and device identifiers, but no audio samples or document contents.
+The synthetic `--render` mode tests its own temporary journal and does not write to the live log.
+
+After a recurrence, keep `events.jsonl` and all four archives and note when the sound leaked and
+which app played it. These files survive an app restart. To follow readable events:
+
+```
+tail -F ~/Library/Logs/BuriedAnchor/events.jsonl | jq -r '[.time, .event, .detail] | @tsv'
+```
 
 ## Verification
 
