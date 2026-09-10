@@ -84,6 +84,9 @@ tap is unsuitable for that restriction: macOS 27 discarded its `deviceUID` in li
 - Retries use monotonic 1/2/5/15/30-second deadlines. A Core Audio service reset invalidates taps,
   process IDs, cached ownership, listeners, and queued commands from the old generation; fresh
   discovery reapplies saved settings. Wake and route/format changes trigger reconciliation.
+- A default output change recreates every controlled tap on the new device and pre-rolls IO once,
+  muted sources included. Updating a tap's device in place left HAL reporting `muted` while the
+  process still played audibly on the new device until the tap had been read there.
 - One serial control queue owns graph mutations. The IO callback has preallocated storage and
   atomic gains/meters. SwiftUI receives snapshots and updates displayed meters only when visible.
 - Gains are saved by bundle ID, or by full executable path when an owning app cannot be found.

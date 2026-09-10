@@ -159,6 +159,33 @@ enum CoordinatorChecks {
             core.shutdown()
         }
 
+        do {
+            let hardware = FakeAudioHardware()
+            var time: TimeInterval = 0
+            let core = AudioCoordinator(hardware: hardware, now: { time })
+            core.setGain(0, key: a, members: [11])
+            core.tick()
+            time = 2
+            core.tick()
+            let oldTap = core.taps[a]?.id
+            hardware.output = OutputRoute(id: 2, uid: "output.two", name: "Headphones")
+            core.invalidate(reason: "default output changed")
+            core.tick()
+            let movedTap = core.taps[a]?.id
+            check(core.lastError == nil && core.running && core.controls[a] == .muted
+                  && core.taps[a]?.route == "output.two" && movedTap != oldTap && !hardware.taps.keys.contains(oldTap ?? 0),
+                  "a live default output change recreates and primes muted taps on the new device")
+            time = 4
+            core.tick()
+            check(!core.running && core.taps[a]?.behavior == .muted && core.lastError == nil,
+                  "the moved tap's pre-roll expires without reopening direct playback")
+            core.invalidate(reason: "wake")
+            core.tick()
+            check(!core.running && core.taps[a]?.id == movedTap,
+                  "an unchanged default output neither recreates nor primes the tap")
+            core.shutdown()
+        }
+
         for operation in ["destroyIO", "destroyAggregate", "destroyTap", "defaultOutput", "startIO"] {
             let hardware = FakeAudioHardware()
             var time: TimeInterval = 0

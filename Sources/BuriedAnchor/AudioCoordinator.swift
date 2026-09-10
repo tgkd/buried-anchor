@@ -255,6 +255,13 @@ final class AudioCoordinator: @unchecked Sendable {
                 taps.removeValue(forKey: key)
             }
             for key in eligible.keys.sorted(by: { $0.raw < $1.raw }) {
+                guard let tap = taps[key], tap.route != output.uid || tap.stream != output.stream else { continue }
+                try hardware.destroyTap(tap.id)
+                taps.removeValue(forKey: key)
+                pendingPriming.insert(key)
+                DiagnosticLog.record("graph.tapMoved", "source=\(key.raw) from=\(tap.route) to=\(output.uid)")
+            }
+            for key in eligible.keys.sorted(by: { $0.raw < $1.raw }) {
                 let request = eligible[key]!
                 do {
                     if var tap = taps[key] {
