@@ -34,6 +34,7 @@ enum LoginItem {
 
 struct SettingsView: View {
     let model: MixerModel
+    @State private var journalBytes: UInt64 = 0
 
     private var launchBinding: Binding<Bool> {
         Binding(
@@ -83,6 +84,24 @@ struct SettingsView: View {
             }
 
             Section {
+                LabeledContent("Journal", value: Self.byteCount(journalBytes))
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(
+                        "Always on. Records source, device and capture events for troubleshooting; "
+                            + "no audio is stored. Rotates automatically at about 10 MB."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Button("Show in Finder") { DiagnosticLog.revealInFinder() }
+                        .font(.caption)
+                }
+            } header: {
+                Text("Diagnostics")
+            }
+
+            Section {
                 LabeledContent("Version", value: Self.version)
                 LabeledContent("System audio", value: model.permission.isGranted ? "Allowed" : "Not allowed")
                 if !model.permission.isGranted {
@@ -97,7 +116,14 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 420)
         .fixedSize(horizontal: false, vertical: true)
-        .onAppear { model.refreshSettingsState() }
+        .onAppear {
+            model.refreshSettingsState()
+            journalBytes = DiagnosticLog.bytesOnDisk()
+        }
+    }
+
+    private static func byteCount(_ bytes: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     }
 
     private static var version: String {

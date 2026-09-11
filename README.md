@@ -66,6 +66,12 @@ tap is unsuitable for that restriction: macOS 27 discarded its `deviceUID` in li
   by `.muted`; activity resumes rendering. New members of any adjusted source, muted ones included,
   pre-roll IO for 1.5 seconds to establish capture before a short sound. Pre-roll is tracked per
   source, and only a source that still exists with a non-unity gain can hold IO open.
+- A pre-roll that only muted (0%) sources need runs on a private aggregate made of the taps alone,
+  with a silent IOProc and no output sub-device, so the physical output device never starts for a
+  muted app. Starting the real output for that pre-roll pulled auto-switching headphones away from
+  another device with nothing to play. If the HAL rejects the tap-only aggregate, the pre-roll falls
+  back to the output graph and the journal records `graph.primingFallback`. A pre-roll involving a
+  nonzero source still uses the output graph so its first sound renders at the requested level.
 - Before replacing a graph, the coordinator verifies mute guards, stops and destroys its IOProc,
   destroys the aggregate, reconciles taps, validates the new layout, then starts replacement IO.
 - A mute guard that fails because the tap's output device disappeared (unplugged or lost across
@@ -129,7 +135,8 @@ clipped at full scale. Neither mode limits unmanaged apps mixed downstream by ma
 
 ## Diagnostic journal
 
-Normal launches automatically append to `~/Library/Logs/BuriedAnchor/events.jsonl`.
+Normal launches automatically append to `~/Library/Logs/BuriedAnchor/events.jsonl`. Settings shows
+the journal's size on disk under Diagnostics with a Show in Finder button that reveals the file.
 Each JSON line includes UTC time, monotonic uptime, PID and a launch-session ID. Startup records
 include the actual app path, Git revision, bundle build date, OS and login-item status.
 The journal records saved/requested gains, source membership and playback changes, sleep/wake,

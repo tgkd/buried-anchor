@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 enum DiagnosticLog {
@@ -12,6 +13,27 @@ enum DiagnosticLog {
     }
 
     static func flush() { writer?.flush() }
+
+    static var journalURL: URL { directory.appendingPathComponent("events.jsonl") }
+
+    static func bytesOnDisk() -> UInt64 {
+        let manager = FileManager.default
+        guard let names = try? manager.contentsOfDirectory(atPath: directory.path) else { return 0 }
+        return names.filter { $0.hasPrefix("events") && $0.hasSuffix(".jsonl") }.reduce(0) { total, name in
+            let size = (try? manager.attributesOfItem(atPath: directory.appendingPathComponent(name).path))?[.size] as? UInt64
+            return total + (size ?? 0)
+        }
+    }
+
+    static func revealInFinder() {
+        flush()
+        let manager = FileManager.default
+        if manager.fileExists(atPath: journalURL.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([journalURL])
+        } else {
+            NSWorkspace.shared.activateFileViewerSelecting([directory])
+        }
+    }
 }
 
 /// File I/O is confined to a separate queue. Never call from the audio callback.

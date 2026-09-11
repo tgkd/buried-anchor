@@ -70,6 +70,9 @@ shared. Debug logs are not reliably retained; errors include actionable recovery
   user mute remains only when verified. Do not put unconditional bypass claims in error messages.
 - 100% releases capture. 0% can hold a .muted tap without active output. Dormant adjusted sources
   use .muted until playback resumes. Idle/pre-roll/retry deadlines use system uptime.
+- HAL only mutes a .muted tap after an IOProc has read it on its current device. Prime taps that
+  only 0% sources need through a tap-only aggregate with a silent IOProc; never start the physical
+  output device for a muted source, because that steals auto-switching headphones.
 - Supported live route: default output, one mono/stereo stream. Device-and-stream tap descriptions
   are required: macOS 27 ignored deviceUID on a stereoMixdownOfProcesses tap. Verify device, stream,
   processes, and mute readback. Do not broaden support without real hardware evidence. An idle

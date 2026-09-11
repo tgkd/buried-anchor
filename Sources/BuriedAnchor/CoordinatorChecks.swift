@@ -67,13 +67,15 @@ enum CoordinatorChecks {
             core.updateActivity([a])
             core.preRoll([a])
             core.tick()
-            check(core.running && core.controls[a] == .muted && core.taps[a]?.behavior == .muted
-                  && hardware.events.contains("startIO") && !hardware.events.contains("mute:test.a:mutedWhenTapped"),
-                  "new zero-percent source pre-rolls output while its tap stays muted")
+            check(core.priming && !core.running && core.controls[a] == .muted && core.taps[a]?.behavior == .muted
+                  && hardware.events.contains("startIO") && hardware.primingBuilds == 1 && hardware.builds == 0
+                  && !hardware.events.contains("mute:test.a:mutedWhenTapped"),
+                  "new zero-percent source primes its muted tap without starting the output device")
             time = 1.6
             core.tick()
-            check(!core.running && core.aggregate == nil && core.taps[a]?.behavior == .muted && core.controls[a] == .muted,
-                  "muted pre-roll releases output after its deadline and keeps the tap")
+            check(!core.priming && !core.running && core.aggregate == nil && !hardware.hasIO
+                  && core.taps[a]?.behavior == .muted && core.controls[a] == .muted,
+                  "muted priming releases its callback after the deadline and keeps the tap")
 
             core.setGain(0.1, key: b, members: [12])
             core.tick()
@@ -81,12 +83,12 @@ enum CoordinatorChecks {
             var events = hardware.events.count
             core.syncMembers([11, 13], key: a)
             core.tick()
-            check(core.running && core.taps[a]?.members == [11, 13] && core.taps[a]?.behavior == .muted
-                  && hardware.events.dropFirst(events).contains("startIO"),
-                  "a fresh member of a muted source pre-rolls output so its onset is muted")
+            check(core.priming && !core.running && core.taps[a]?.members == [11, 13] && core.taps[a]?.behavior == .muted
+                  && hardware.events.dropFirst(events).contains("startIO") && hardware.builds == 0,
+                  "a fresh member of a muted source primes its tap so its onset is muted")
             time = 3.2
             core.tick()
-            check(!core.running && core.aggregate == nil, "member pre-roll on a muted source also expires")
+            check(!core.priming && !core.running && core.aggregate == nil, "member priming on a muted source also expires")
 
             core.preRoll([b])
             core.tick()
@@ -150,12 +152,12 @@ enum CoordinatorChecks {
             check(core.lastError == nil && core.route?.uid == "output.two"
                   && core.taps[a]?.route == "output.two" && core.taps[a]?.id != oldTap,
                   "disconnected output does not trap recovery in its old mute guard")
-            check(core.requests[a]?.gain == 0 && core.controls[a] == .muted && core.running,
+            check(core.requests[a]?.gain == 0 && core.controls[a] == .muted && core.priming && !core.running,
                   "replacement mute preserves intent and primes capture with unchanged idle members")
             time = 4
             core.tick()
-            check(!core.running && core.taps[a]?.behavior == .muted && core.lastError == nil,
-                  "replacement pre-roll expires without reopening direct playback")
+            check(!core.priming && !core.running && core.taps[a]?.behavior == .muted && core.lastError == nil,
+                  "replacement priming expires without reopening direct playback")
             core.shutdown()
         }
 
@@ -172,17 +174,59 @@ enum CoordinatorChecks {
             core.invalidate(reason: "default output changed")
             core.tick()
             let movedTap = core.taps[a]?.id
-            check(core.lastError == nil && core.running && core.controls[a] == .muted
-                  && core.taps[a]?.route == "output.two" && movedTap != oldTap && !hardware.taps.keys.contains(oldTap ?? 0),
-                  "a live default output change recreates and primes muted taps on the new device")
+            check(core.lastError == nil && core.priming && !core.running && core.controls[a] == .muted
+                  && core.taps[a]?.route == "output.two" && movedTap != oldTap && !hardware.taps.keys.contains(oldTap ?? 0)
+                  && hardware.builds == 0,
+                  "a live default output change recreates and primes muted taps without starting the new output")
             time = 4
             core.tick()
-            check(!core.running && core.taps[a]?.behavior == .muted && core.lastError == nil,
-                  "the moved tap's pre-roll expires without reopening direct playback")
+            check(!core.priming && !core.running && core.taps[a]?.behavior == .muted && core.lastError == nil,
+                  "the moved tap's priming expires without reopening direct playback")
             core.invalidate(reason: "wake")
             core.tick()
-            check(!core.running && core.taps[a]?.id == movedTap,
+            check(!core.priming && !core.running && core.taps[a]?.id == movedTap,
                   "an unchanged default output neither recreates nor primes the tap")
+            core.shutdown()
+        }
+
+        for operation in ["createPrimingAggregate", "createSilentIO"] {
+            let hardware = FakeAudioHardware()
+            var time: TimeInterval = 0
+            let core = AudioCoordinator(hardware: hardware, now: { time })
+            hardware.failure = operation
+            hardware.failuresLeft = 100
+            core.setGain(0, key: a, members: [11])
+            core.tick()
+            check(core.lastError == nil && core.running && !core.priming && core.controls[a] == .muted
+                  && core.taps[a]?.behavior == .muted && hardware.builds == 1 && hardware.hasIO,
+                  "\(operation) failure falls back to an output pre-roll with the tap still muted")
+            time = 2
+            core.tick()
+            check(!core.running && !core.priming && core.aggregate == nil && !hardware.hasIO && core.lastError == nil,
+                  "\(operation) fallback pre-roll expires normally")
+            core.shutdown()
+        }
+
+        do {
+            let hardware = FakeAudioHardware()
+            var time: TimeInterval = 0
+            let core = AudioCoordinator(hardware: hardware, now: { time })
+            hardware.failure = "startIO"
+            hardware.failuresLeft = 2
+            core.setGain(0, key: a, members: [11])
+            core.tick()
+            check(core.lastError != nil && !core.priming && !core.running && core.aggregate == nil && !hardware.hasIO
+                  && core.taps[a]?.behavior == .muted && core.controls[a] == .muted,
+                  "a priming start failure cleans up and keeps the verified mute")
+            time = 1
+            core.tick()
+            check(core.lastError == nil && core.priming && !core.running,
+                  "priming resumes on retry and still avoids the output device")
+            core.setGain(0.5, key: b, members: [12])
+            core.updateActivity([b])
+            core.tick()
+            check(core.running && !core.priming && core.controls[b] == .rendering && core.controls[a] == .muted,
+                  "audible demand replaces the priming graph with the output graph")
             core.shutdown()
         }
 
@@ -489,6 +533,7 @@ private final class FakeAudioHardware: AudioHardwareBackend {
     var aggregate: AudioObjectID?
     var hasIO = false
     var builds = 0
+    var primingBuilds = 0
     private var nextID: AudioObjectID = 1000
 
     private func hit(_ operation: String) throws {
@@ -540,6 +585,13 @@ private final class FakeAudioHardware: AudioHardwareBackend {
         builds += 1
         return nextID
     }
+    func createPrimingAggregate(taps: [ManagedTap]) throws -> AudioObjectID {
+        try hit("createPrimingAggregate")
+        nextID += 1
+        aggregate = nextID
+        primingBuilds += 1
+        return nextID
+    }
     func destroyAggregate(_ id: AudioObjectID) throws {
         try hit("destroyAggregate")
         guard !hasIO else { throw AudioFailure(message: "Destroyed aggregate with live callback") }
@@ -557,6 +609,11 @@ private final class FakeAudioHardware: AudioHardwareBackend {
         try hit("createIO")
         hasIO = true
         return unsafeBitCast(UInt(1), to: AudioDeviceIOProcID.self)
+    }
+    func createSilentIO(_ aggregate: AudioObjectID) throws -> AudioDeviceIOProcID {
+        try hit("createSilentIO")
+        hasIO = true
+        return unsafeBitCast(UInt(2), to: AudioDeviceIOProcID.self)
     }
     func startIO(_ aggregate: AudioObjectID, _ io: AudioDeviceIOProcID) throws { try hit("startIO") }
     func stopIO(_ aggregate: AudioObjectID, _ io: AudioDeviceIOProcID) throws { try hit("stopIO") }

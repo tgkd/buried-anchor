@@ -1,5 +1,6 @@
 import CoreAudio
 import Foundation
+import Synchronization
 
 struct AudioFailure: Error, LocalizedError {
     let message: String
@@ -32,9 +33,11 @@ protocol AudioHardwareBackend: AnyObject {
     func updateTap(_ tap: ManagedTap) throws -> [AudioObjectID]
     func destroyTap(_ id: AudioObjectID) throws
     func createAggregate(_ route: OutputRoute, taps: [ManagedTap]) throws -> AudioObjectID
+    func createPrimingAggregate(taps: [ManagedTap]) throws -> AudioObjectID
     func destroyAggregate(_ id: AudioObjectID) throws
     func layout(_ aggregate: AudioObjectID, route: OutputRoute, taps: [ManagedTap]) throws -> GraphLayout
     func createIO(_ aggregate: AudioObjectID, renderer: MixRenderer) throws -> AudioDeviceIOProcID
+    func createSilentIO(_ aggregate: AudioObjectID) throws -> AudioDeviceIOProcID
     func startIO(_ aggregate: AudioObjectID, _ io: AudioDeviceIOProcID) throws
     func stopIO(_ aggregate: AudioObjectID, _ io: AudioDeviceIOProcID) throws
     func destroyIO(_ aggregate: AudioObjectID, _ io: AudioDeviceIOProcID) throws
@@ -43,6 +46,8 @@ protocol AudioHardwareBackend: AnyObject {
 
 final class CoreAudioBackend: AudioHardwareBackend {
     static let aggregatePrefix = "com.buriedanchor.aggregate."
+    private final class CallbackCounter: @unchecked Sendable { let value = Atomic<UInt64>(0) }
+    private let silentCallbacks = CallbackCounter()
 
     private func check(_ status: OSStatus, _ operation: String, destroying: Bool = false) throws {
         DiagnosticLog.record("hal.operation", "operation=\(operation) status=\(statusName(status))")
@@ -162,7 +167,7 @@ final class CoreAudioBackend: AudioHardwareBackend {
         var lines: [String] = []
         let output = systemObject.value(propertyAddress(kAudioHardwarePropertyDefaultOutputDevice), default: UInt32(0))
         let effects = systemObject.value(propertyAddress(kAudioHardwarePropertyDefaultSystemOutputDevice), default: UInt32(0))
-        lines.append("defaultOutput=\(output) systemOutput=\(effects) deviceRunning=\(output.value(propertyAddress(kAudioDevicePropertyDeviceIsRunningSomewhere), default: UInt32(0)))")
+        lines.append("defaultOutput=\(output) systemOutput=\(effects) deviceRunning=\(output.value(propertyAddress(kAudioDevicePropertyDeviceIsRunningSomewhere), default: UInt32(0))) primingCallbacks=\(silentCallbacks.value.load(ordering: .relaxed))")
         for tap in taps.sorted(by: { $0.key.raw < $1.key.raw }) {
             do { lines.append(tapSummary(tap.id, try readTap(tap.id))) }
             catch { lines.append("source=\(tap.key.raw) id=\(tap.id) readError=\(error.localizedDescription)") }
@@ -196,6 +201,29 @@ final class CoreAudioBackend: AudioHardwareBackend {
         try check(AudioHardwareCreateAggregateDevice(composition as CFDictionary, &id), "Create mix device")
         guard id != kAudioObjectUnknown else { throw AudioFailure(message: "HAL returned an invalid aggregate") }
         DiagnosticLog.record("graph.created", "aggregate=\(id) output=\(route.uid) taps=\(taps.map(\.id))")
+        return id
+    }
+
+    func createPrimingAggregate(taps: [ManagedTap]) throws -> AudioObjectID {
+        let composition: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "Buried Anchor Prime",
+            kAudioAggregateDeviceUIDKey: Self.aggregatePrefix + UUID().uuidString,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceTapAutoStartKey: false,
+            kAudioAggregateDeviceTapListKey: taps.map {
+                [kAudioSubTapUIDKey: $0.uuid.uuidString, kAudioSubTapDriftCompensationKey: false] as [String: Any]
+            }
+        ]
+        var id = AudioObjectID(kAudioObjectUnknown)
+        try check(AudioHardwareCreateAggregateDevice(composition as CFDictionary, &id), "Create priming device")
+        guard id != kAudioObjectUnknown else { throw AudioFailure(message: "HAL returned an invalid priming aggregate") }
+        let uuids = Set(id.stringArray(propertyAddress(kAudioAggregateDevicePropertyTapList)).map { $0.uppercased() })
+        guard uuids == Set(taps.map { $0.uuid.uuidString.uppercased() }),
+              id.array(propertyAddress(kAudioAggregateDevicePropertySubTapList), of: AudioObjectID.self).count == taps.count else {
+            try? destroyAggregate(id)
+            throw AudioFailure(message: "Could not verify priming aggregate tap membership")
+        }
+        DiagnosticLog.record("graph.primingCreated", "aggregate=\(id) taps=\(taps.map(\.id))")
         return id
     }
 
@@ -243,6 +271,16 @@ final class CoreAudioBackend: AudioHardwareBackend {
             renderer.render(input: input, output: output)
         }, "Create audio callback")
         guard let io else { throw AudioFailure(message: "HAL returned an invalid audio callback") }
+        return io
+    }
+
+    func createSilentIO(_ aggregate: AudioObjectID) throws -> AudioDeviceIOProcID {
+        var io: AudioDeviceIOProcID?
+        let counter = silentCallbacks
+        try check(AudioDeviceCreateIOProcIDWithBlock(&io, aggregate, nil) { _, _, _, _, _ in
+            counter.value.wrappingAdd(1, ordering: .relaxed)
+        }, "Create priming callback")
+        guard let io else { throw AudioFailure(message: "HAL returned an invalid priming callback") }
         return io
     }
 

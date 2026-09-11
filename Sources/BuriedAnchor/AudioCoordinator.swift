@@ -42,6 +42,7 @@ final class AudioCoordinator: @unchecked Sendable {
     private(set) var aggregate: AudioObjectID?
     private(set) var io: AudioDeviceIOProcID?
     private(set) var running = false
+    private(set) var priming = false
     private(set) var generation = 0
     private(set) var route: OutputRoute?
     private(set) var order: [SourceID] = []
@@ -146,9 +147,13 @@ final class AudioCoordinator: @unchecked Sendable {
     private var wantsIO: Bool {
         let controlled = requests.filter { key, value in value.gain != 1 && taps[key] != nil }
         guard !controlled.isEmpty else { return false }
-        if controlled.contains(where: { key, _ in (prerollUntil[key] ?? 0) > now() }) { return true }
+        if controlled.contains(where: { key, value in value.gain > 0 && (prerollUntil[key] ?? 0) > now() }) { return true }
         if controlled.contains(where: { key, value in value.gain > 0 && playing.contains(key) }) { return true }
         return running && (idleDeadline.map { now() < $0 } ?? false)
+    }
+
+    private var wantsPriming: Bool {
+        requests.contains { key, value in value.gain == 0 && taps[key] != nil && (prerollUntil[key] ?? 0) > now() }
     }
 
     func invalidate(reason: String = "external") {
@@ -198,6 +203,10 @@ final class AudioCoordinator: @unchecked Sendable {
         }
         if running && !wantsIO {
             DiagnosticLog.record("control.suspend", "no IO demand; playing=\(playing.map(\.raw).sorted())")
+            dirty = true
+        }
+        if priming && (!wantsPriming || wantsIO) {
+            DiagnosticLog.record("control.primingDone", "wantsIO=\(wantsIO)")
             dirty = true
         }
         reconcile()
@@ -300,18 +309,15 @@ final class AudioCoordinator: @unchecked Sendable {
             order = sortedTapKeys
             for key in pendingPriming where taps[key] != nil { prerollUntil[key] = now() + 1.5 }
             if !order.isEmpty, wantsIO {
-                let created = try hardware.createAggregate(output, taps: order.compactMap { taps[$0] })
-                aggregate = created
-                let layout = try hardware.layout(created, route: output, taps: order.compactMap { taps[$0] })
-                order = layout.slots.map(\.key)
-                renderer.apply(layout, gains: order.map { requests[$0]?.gain ?? 1 })
-                renderer.configure(sampleRate: layout.sampleRate, framesPerBuffer: hardware.bufferFrames(created))
-                layoutSummary = layout.summary
-                let createdIO = try hardware.createIO(created, renderer: renderer)
-                io = createdIO
-                try hardware.startIO(created, createdIO)
-                running = true
-                for key in order where requests[key]?.gain != 0 { try setBehavior(.mutedWhenTapped, key: key) }
+                try startOutputGraph(output)
+            } else if !order.isEmpty, wantsPriming {
+                do {
+                    try startPrimingGraph()
+                } catch {
+                    DiagnosticLog.record("graph.primingFallback", error.localizedDescription)
+                    try stopGraph()
+                    try startOutputGraph(output)
+                }
             }
             for key in order {
                 controls[key] = requests[key]?.gain == 0 ? .muted : (running ? .rendering : .held)
@@ -321,7 +327,7 @@ final class AudioCoordinator: @unchecked Sendable {
             retryAt = nil
             retryIndex = 0
             revision += 1
-            DiagnosticLog.record("graph.ready", "revision=\(revision) running=\(running) order=\(order.map(\.raw))")
+            DiagnosticLog.record("graph.ready", "revision=\(revision) running=\(running) priming=\(priming) order=\(order.map(\.raw))")
         } catch {
             if guarded {
                 do { try stopGraph() } catch { }
@@ -331,6 +337,31 @@ final class AudioCoordinator: @unchecked Sendable {
     }
 
     private var sortedTapKeys: [SourceID] { taps.keys.sorted { $0.raw < $1.raw } }
+
+    private func startOutputGraph(_ output: OutputRoute) throws {
+        let created = try hardware.createAggregate(output, taps: order.compactMap { taps[$0] })
+        aggregate = created
+        let layout = try hardware.layout(created, route: output, taps: order.compactMap { taps[$0] })
+        order = layout.slots.map(\.key)
+        renderer.apply(layout, gains: order.map { requests[$0]?.gain ?? 1 })
+        renderer.configure(sampleRate: layout.sampleRate, framesPerBuffer: hardware.bufferFrames(created))
+        layoutSummary = layout.summary
+        let createdIO = try hardware.createIO(created, renderer: renderer)
+        io = createdIO
+        try hardware.startIO(created, createdIO)
+        running = true
+        for key in order where requests[key]?.gain != 0 { try setBehavior(.mutedWhenTapped, key: key) }
+    }
+
+    private func startPrimingGraph() throws {
+        let created = try hardware.createPrimingAggregate(taps: order.compactMap { taps[$0] })
+        aggregate = created
+        let createdIO = try hardware.createSilentIO(created)
+        io = createdIO
+        try hardware.startIO(created, createdIO)
+        priming = true
+        layoutSummary = "priming"
+    }
 
     private func oldOutputDisappeared(_ uid: String, guardError: Error) -> Bool {
         do {
@@ -404,6 +435,7 @@ final class AudioCoordinator: @unchecked Sendable {
             try hardware.destroyIO(aggregate, io)
             self.io = nil
             running = false
+            priming = false
         }
         if let aggregate {
             try hardware.destroyAggregate(aggregate)
@@ -420,6 +452,7 @@ final class AudioCoordinator: @unchecked Sendable {
         aggregate = nil
         io = nil
         running = false
+        priming = false
         taps.removeAll()
         order.removeAll()
         renderer.clearSlots()
@@ -462,7 +495,7 @@ final class AudioCoordinator: @unchecked Sendable {
     }
 
     func diagnostics() -> [String] {
-        ["generation=\(generation) running=\(running) aggregate=\(String(describing: aggregate)) io=\(io != nil)",
+        ["generation=\(generation) running=\(running) priming=\(priming) aggregate=\(String(describing: aggregate)) io=\(io != nil)",
          "output=\(route?.name ?? "-") device=\(route?.uid ?? "-") layout=\(layoutSummary)", "error=\(lastError ?? "none")",
          "playing=\(playing.map(\.raw).sorted()) wantsIO=\(wantsIO) idleDeadline=\(String(describing: idleDeadline)) retryAt=\(String(describing: retryAt))"]
         + requests.keys.sorted { $0.raw < $1.raw }.map { key in
