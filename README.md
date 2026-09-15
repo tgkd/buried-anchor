@@ -83,6 +83,12 @@ tap is unsuitable for that restriction: macOS 27 discarded its `deviceUID` in li
 - On failure, nonzero sources return to direct playback when that state can be verified. Explicit
   mute is retained when verified. Failed mute/cleanup operations remain visible, and handles stay
   owned for retry. The app never claims bypass merely because graph construction failed.
+- A process object that just appeared is not added to any tap for one second. Helpers that live
+  shorter than that (Handy runs `osascript` on every dictation) never enter the graph, so they
+  cannot trigger the tap-only priming aggregate. On macOS 27.0 that aggregate being created and
+  destroyed inside a coreaudiod PauseAll/ResumeAll cycle left `ResumeAllContexts` waiting forever
+  and hung every audio client until coreaudiod was restarted. The cost is that a brand-new helper
+  of a muted or adjusted app can be audible at its own level for up to a second.
 - Helper processes come and go while an app is controlled. A member whose HAL object no longer
   exists is pruned from the request and the tap, including inside the mute guard; an app with
   no live members waits without a tap. A live process that HAL refuses to capture fails only

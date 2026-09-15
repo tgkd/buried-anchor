@@ -49,6 +49,10 @@ final class MixerModel {
     private var snapshotPending = false
     private var snapshotQueued = false
     private var permissionProbePending = false
+    private var firstSeen: [AudioObjectID: Date] = [:]
+    private var settledObjects: Set<AudioObjectID> = []
+    private var settleRefreshPending = false
+    private let memberSettle: TimeInterval = 1
     private var objectBaseline = false
     private var reconcilePending = false
     private var tick = 0
@@ -144,7 +148,7 @@ final class MixerModel {
         if clamped != 100 {
             _ = claimSlot(for: id, force: true)
         }
-        applyGain(clamped, for: id, objectIDs: rows[index].objectIDs)
+        applyGain(clamped, for: id, objectIDs: settledMembers(rows[index].objectIDs, at: Date()))
         rows[index].isControlled = engine.isControlled(id)
         rows[index].isActive = engine.isActive(id)
         engineError = engine.lastError
@@ -305,6 +309,8 @@ final class MixerModel {
             engineGeneration = engine.generation
             discoveryGeneration += 1
             objectOwners.removeAll()
+            firstSeen.removeAll()
+            settledObjects.removeAll()
             objectBaseline = false
             discovery.reset()
             installDiscoveryListener()
@@ -345,17 +351,40 @@ final class MixerModel {
     }
 
     private func coverNewObjects(_ coverage: DiscoveryCoverage) {
-        var waking: Set<SourceID> = []
-        for object in coverage.fresh where objectOwners[object.objectID] == nil {
-            let key = object.key
-            guard isManaged(key) else { continue }
-            DiagnosticLog.record("discovery.fresh", "source=\(key.raw) object=\(object.objectID) pid=\(object.pid)")
-            objectOwners[object.objectID] = key
-            if needsRendering(key) { waking.insert(key) }
-            guard engine.isControlled(key) else { continue }
-            engine.syncObjectIDs(coverage.live.filter { objectOwners[$0] == key }.sorted(), for: key)
+        let now = Date()
+        var deferred = false
+        for object in coverage.fresh where firstSeen[object.objectID] == nil && isManaged(object.key) {
+            DiagnosticLog.record("discovery.fresh", "source=\(object.key.raw) object=\(object.objectID) pid=\(object.pid) settleAfter=\(memberSettle)")
+            firstSeen[object.objectID] = now
+            deferred = true
         }
-        if !waking.isEmpty { engine.preRoll(waking) }
+        if deferred { scheduleSettleRefresh() }
+    }
+
+    private func settledMembers(_ objectIDs: [AudioObjectID], at now: Date) -> [AudioObjectID] {
+        var settled: [AudioObjectID] = []
+        var waiting = false
+        for objectID in objectIDs {
+            let seen = firstSeen[objectID] ?? now
+            firstSeen[objectID] = seen
+            if now.timeIntervalSince(seen) >= memberSettle {
+                settled.append(objectID)
+            } else {
+                waiting = true
+            }
+        }
+        if waiting { scheduleSettleRefresh() }
+        return settled
+    }
+
+    private func scheduleSettleRefresh() {
+        guard !settleRefreshPending else { return }
+        settleRefreshPending = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(Int(memberSettle * 1000) + 50))
+            self.settleRefreshPending = false
+            self.refreshList()
+        }
     }
 
     private func handleActivityChange() {
@@ -428,24 +457,31 @@ final class MixerModel {
         let owners = groups.reduce(into: [AudioObjectID: SourceID]()) { map, group in
             for objectID in group.objectIDs { map[objectID] = group.id }
         }
-        let appeared = objectBaseline ? Set(owners.keys).subtracting(objectOwners.keys) : []
-        objectBaseline = true
+        firstSeen = firstSeen.filter { owners[$0.key] != nil }
+        if !objectBaseline {
+            objectBaseline = true
+            for objectID in owners.keys { firstSeen[objectID] = .distantPast }
+            settledObjects = Set(owners.keys)
+        }
         objectOwners = owners
-        let waking = Set(appeared.compactMap { owners[$0] }.filter(needsRendering))
+        let settledNow = Set(settledMembers(Array(owners.keys), at: now))
+        let waking = Set(settledNow.subtracting(settledObjects).compactMap { owners[$0] }.filter(needsRendering))
+        settledObjects = settledNow
         if !waking.isEmpty { engine.preRoll(waking) }
 
         for group in groups {
             presentation[group.id] = Presentation(name: group.name, icon: group.icon)
             if group.isPlaying { lastPlaying[group.id] = now }
+            let members = group.objectIDs.filter(settledObjects.contains)
             if engine.isControlled(group.id) {
-                engine.syncObjectIDs(group.objectIDs, for: group.id)
+                engine.syncObjectIDs(members, for: group.id)
                 lastLive[group.id] = now
                 continue
             }
-            guard let saved = percents[group.id], saved != 100, !group.objectIDs.isEmpty,
+            guard let saved = percents[group.id], saved != 100, !members.isEmpty,
                   claimSlot(for: group.id)
             else { continue }
-            applyGain(saved, for: group.id, objectIDs: group.objectIDs)
+            applyGain(saved, for: group.id, objectIDs: members)
         }
 
         var next: [Row] = []
