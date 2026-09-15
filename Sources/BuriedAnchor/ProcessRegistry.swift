@@ -10,11 +10,12 @@ struct AudioProcess {
     let isRunningOutput: Bool
 }
 
-struct AudioAppGroup: Identifiable, Equatable {
+struct AudioAppGroup: Identifiable, Equatable, @unchecked Sendable {
     let id: SourceID
     let name: String
     let icon: NSImage?
     let objectIDs: [AudioObjectID]
+    let pids: [pid_t]
     let isPlaying: Bool
 
     static func == (lhs: AudioAppGroup, rhs: AudioAppGroup) -> Bool {
@@ -25,7 +26,6 @@ struct AudioAppGroup: Identifiable, Equatable {
     }
 }
 
-@MainActor
 final class ProcessRegistry {
     private struct CachedOwner {
         let key: SourceID
@@ -58,6 +58,7 @@ final class ProcessRegistry {
                 name: display[key]?.name ?? key.fallbackName,
                 icon: display[key]?.app?.icon,
                 objectIDs: procs.map(\.objectID).sorted(),
+                pids: procs.sorted { $0.objectID < $1.objectID }.map(\.pid),
                 isPlaying: procs.contains(where: \.isRunningOutput)
             )
         }

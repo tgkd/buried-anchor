@@ -95,6 +95,10 @@ tap is unsuitable for that restriction: macOS 27 discarded its `deviceUID` in li
   process still played audibly on the new device until the tap had been read there.
 - One serial control queue owns graph mutations. The IO callback has preallocated storage and
   atomic gains/meters. SwiftUI receives snapshots and updates displayed meters only when visible.
+- The main actor never calls into Core Audio synchronously. Process discovery, activity listeners
+  and the capture-permission probe run on their own queues and post results back. Quit and the
+  explicit diagnostic snapshot wait for the control queue at most a few seconds; if coreaudiod is
+  hung, the journal records `engine.stopTimedOut` and the app exits without graph teardown.
 - Gains are saved by bundle ID, or by full executable path when an owning app cannot be found.
   Legacy short executable-name preferences are discarded to avoid applying a gain to an unrelated
   program with the same truncated name. Bundle preferences are preserved.
@@ -103,7 +107,7 @@ tap is unsuitable for that restriction: macOS 27 discarded its `deviceUID` in li
 
 | File | Responsibility |
 |---|---|
-| `ProcessRegistry.swift`, `SourceID.swift` | Process discovery, owning-app identity, presentation |
+| `ProcessRegistry.swift`, `Discovery.swift`, `SourceID.swift` | Process discovery off the main actor, owning-app identity, presentation |
 | `MixerModel.swift` | Saved intent, rows, discovery events, UI state |
 | `TapEngine.swift` | Main-actor facade, serial control loop, generation-tagged listeners and commands |
 | `AudioCoordinator.swift` | Resource ownership, transitions, mute policy, suspension, retries, recovery |

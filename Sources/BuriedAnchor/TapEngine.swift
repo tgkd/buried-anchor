@@ -1,5 +1,6 @@
 import CoreAudio
 import Foundation
+import os
 
 @MainActor
 final class TapEngine {
@@ -189,7 +190,8 @@ private final class AudioControlLoop: @unchecked Sendable {
     }
 
     func stop() {
-        queue.sync {
+        let done = DispatchSemaphore(value: 0)
+        queue.async { [self] in
             started = false
             timer?.cancel()
             timer = nil
@@ -197,8 +199,28 @@ private final class AudioControlLoop: @unchecked Sendable {
             graphListeners.removeAll()
             coordinator.shutdown()
             DiagnosticLog.record("engine.stopped", coordinator.diagnostics().joined(separator: " | "))
+            done.signal()
+        }
+        if done.wait(timeout: .now() + Self.barrierTimeout) == .timedOut {
+            DiagnosticLog.record("engine.stopTimedOut", "control queue unresponsive for \(Self.barrierTimeout)s; exiting without graph teardown")
+            DiagnosticLog.flush()
         }
     }
 
-    func diagnostics() -> [String] { queue.sync { coordinator.diagnostics() } }
+    func diagnostics() -> [String] {
+        let result = OSAllocatedUnfairLock<[String]?>(initialState: nil)
+        let done = DispatchSemaphore(value: 0)
+        queue.async { [self] in
+            let lines = coordinator.diagnostics()
+            result.withLock { $0 = lines }
+            done.signal()
+        }
+        if done.wait(timeout: .now() + Self.barrierTimeout) == .timedOut {
+            DiagnosticLog.record("engine.diagnosticsTimedOut", "control queue unresponsive for \(Self.barrierTimeout)s")
+            return ["control queue unresponsive: no snapshot within \(Int(Self.barrierTimeout))s, Core Audio may be hung"]
+        }
+        return result.withLock { $0 } ?? []
+    }
+
+    private static let barrierTimeout: TimeInterval = 3
 }

@@ -39,14 +39,16 @@ final class MixerModel {
         let icon: NSImage?
     }
 
-    private let registry = ProcessRegistry()
+    private var discovery: DiscoveryWorker!
     private let engine = TapEngine()
     private var percents: [SourceID: Double] = [:]
     private var premute: [SourceID: Double] = [:]
     private var timer: Timer?
     private var processListListener: PropertyListener?
-    private var activityListeners: [AudioObjectID: [PropertyListener]] = [:]
     private var objectOwners: [AudioObjectID: SourceID] = [:]
+    private var snapshotPending = false
+    private var snapshotQueued = false
+    private var permissionProbePending = false
     private var objectBaseline = false
     private var reconcilePending = false
     private var tick = 0
@@ -66,10 +68,6 @@ final class MixerModel {
     private let meterFloor: Float = 0.0002
     private let lingerInterval: TimeInterval = 300
     private let tapRetention: TimeInterval = 300
-    private static let activitySelectors: [AudioObjectPropertySelector] = [
-        kAudioProcessPropertyIsRunning,
-        kAudioProcessPropertyIsRunningOutput
-    ]
     private static let defaultsKey = "appVolumePercents"
     private static let premuteKey = "appVolumePremute"
     private static let softClipKey = "softClip"
@@ -81,12 +79,18 @@ final class MixerModel {
         launchAtLogin = LoginItem.isEnabled
         normalizeStorage(Self.defaultsKey, percents)
         normalizeStorage(Self.premuteKey, premute)
+        discovery = DiscoveryWorker { [weak self] generation in
+            Task { @MainActor in
+                guard let self, self.discoveryGeneration == generation else { return }
+                self.handleActivityChange()
+            }
+        }
     }
 
     func start() {
         guard !started else { return }
         started = true
-        permission = AudioCapturePermission.probe()
+        probePermission("startup")
         DiagnosticLog.record("model.start", "permission=\(permission) saved=\(percents.sorted { $0.key.raw < $1.key.raw }.map { "\($0.key.raw)=\($0.value)" }.joined(separator: ","))")
         engine.onUpdate = { [weak self] in self?.refreshControlState() }
         engine.start()
@@ -115,7 +119,7 @@ final class MixerModel {
         timer?.invalidate()
         timer = nil
         processListListener = nil
-        activityListeners.removeAll()
+        discovery.shutdown()
         if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
         wakeObserver = nil
         if let sleepObserver { NSWorkspace.shared.notificationCenter.removeObserver(sleepObserver) }
@@ -135,7 +139,7 @@ final class MixerModel {
         guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
         rows[index].percent = clamped
         if !permission.isGranted {
-            permission = AudioCapturePermission.probe()
+            probePermission("volume")
         }
         if clamped != 100 {
             _ = claimSlot(for: id, force: true)
@@ -179,13 +183,28 @@ final class MixerModel {
     }
 
     func recheckPermission() {
-        permission = AudioCapturePermission.probe()
-        DiagnosticLog.record("permission.check", "result=\(permission)")
+        probePermission("recheck")
     }
 
     func refreshSettingsState() {
         launchAtLogin = LoginItem.isEnabled
-        permission = AudioCapturePermission.probe()
+        probePermission("settings")
+    }
+
+    private func probePermission(_ reason: String) {
+        guard !permissionProbePending else { return }
+        permissionProbePending = true
+        AudioCapturePermission.probe { [weak self] result in
+            Task { @MainActor in
+                guard let self else { return }
+                self.permissionProbePending = false
+                DiagnosticLog.record("permission.check", "reason=\(reason) result=\(result)")
+                guard self.permission != result else { return }
+                self.permission = result
+                self.refreshControlState()
+                if result.isGranted { self.refreshList() }
+            }
+        }
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -285,10 +304,9 @@ final class MixerModel {
         if engineGeneration != engine.generation {
             engineGeneration = engine.generation
             discoveryGeneration += 1
-            activityListeners.removeAll()
             objectOwners.removeAll()
             objectBaseline = false
-            registry.reset()
+            discovery.reset()
             installDiscoveryListener()
             refreshList()
         }
@@ -315,65 +333,33 @@ final class MixerModel {
         }
     }
 
-    private func syncActivityListeners() {
-        let objectIDs = registry.objectIDs
+    private func handleProcessListChange() {
         let generation = discoveryGeneration
-        for objectID in activityListeners.keys where !objectIDs.contains(objectID) {
-            activityListeners.removeValue(forKey: objectID)
-        }
-        for objectID in objectIDs where activityListeners[objectID] == nil {
-            activityListeners[objectID] = Self.activitySelectors.compactMap { selector in
-                PropertyListener(objectID, propertyAddress(selector)) { [weak self] in
-                    Task { @MainActor in
-                        guard let self, self.discoveryGeneration == generation else { return }
-                        self.handleActivityChange()
-                    }
-                }
+        discovery.cover(known: Set(objectOwners.keys)) { [weak self] coverage in
+            Task { @MainActor in
+                guard let self, self.discoveryGeneration == generation else { return }
+                self.coverNewObjects(coverage)
             }
         }
-    }
-
-    private func handleProcessListChange() {
-        coverNewObjects()
         scheduleReconcile()
     }
 
-    private func coverNewObjects() {
-        let live = registry.objectIDList()
-        let fresh = live.filter { objectOwners[$0] == nil }
-        guard !fresh.isEmpty else { return }
+    private func coverNewObjects(_ coverage: DiscoveryCoverage) {
         var waking: Set<SourceID> = []
-        for objectID in fresh {
-            guard let key = registry.owner(of: objectID), isManaged(key) else { continue }
-            DiagnosticLog.record("discovery.fresh", "source=\(key.raw) object=\(objectID) pid=\(objectID.value(propertyAddress(kAudioProcessPropertyPID), default: pid_t(-1)))")
-            objectOwners[objectID] = key
+        for object in coverage.fresh where objectOwners[object.objectID] == nil {
+            let key = object.key
+            guard isManaged(key) else { continue }
+            DiagnosticLog.record("discovery.fresh", "source=\(key.raw) object=\(object.objectID) pid=\(object.pid)")
+            objectOwners[object.objectID] = key
             if needsRendering(key) { waking.insert(key) }
             guard engine.isControlled(key) else { continue }
-            engine.syncObjectIDs(live.filter { objectOwners[$0] == key }.sorted(), for: key)
+            engine.syncObjectIDs(coverage.live.filter { objectOwners[$0] == key }.sorted(), for: key)
         }
         if !waking.isEmpty { engine.preRoll(waking) }
     }
 
     private func handleActivityChange() {
-        pulsePlayback()
-        updateSuspension()
         scheduleReconcile()
-    }
-
-    private func pulsePlayback() {
-        let controlled = Set(engine.controlledKeys)
-        guard !controlled.isEmpty else { return }
-        var running: Set<SourceID> = []
-        for (objectID, key) in objectOwners where controlled.contains(key) {
-            guard objectID.value(
-                propertyAddress(kAudioProcessPropertyIsRunningOutput), default: UInt32(0)
-            ) != 0 else { continue }
-            running.insert(key)
-        }
-        playingKeys.subtract(controlled)
-        playingKeys.formUnion(running)
-        let now = Date()
-        for key in running { lastPlaying[key] = now }
     }
 
     private func isManaged(_ key: SourceID) -> Bool {
@@ -389,7 +375,7 @@ final class MixerModel {
         tick += 1
         if tick % 10 == 0 {
             refreshList()
-            registry.forgetTerminated()
+            discovery.forgetTerminated()
         }
         if isMetering { refreshMeters() }
         if outputDeviceName != engine.outputDeviceName {
@@ -401,21 +387,40 @@ final class MixerModel {
     }
 
     private func refreshList() {
-        let groups = registry.snapshot()
+        guard !snapshotPending else {
+            snapshotQueued = true
+            return
+        }
+        snapshotPending = true
+        let generation = discoveryGeneration
+        discovery.snapshot(generation: generation) { [weak self] groups in
+            Task { @MainActor in
+                guard let self else { return }
+                self.snapshotPending = false
+                if self.discoveryGeneration == generation, self.started {
+                    self.applySnapshot(groups)
+                }
+                if self.snapshotQueued {
+                    self.snapshotQueued = false
+                    self.refreshList()
+                }
+            }
+        }
+    }
+
+    private func applySnapshot(_ groups: [AudioAppGroup]) {
         var currentGroups: [SourceID: String] = [:]
         for group in groups {
             let state = "source=\(group.id.raw) members=\(group.objectIDs) playing=\(group.isPlaying)"
             currentGroups[group.id] = state
             if loggedGroups[group.id] != state {
-                let pids = group.objectIDs.map { $0.value(propertyAddress(kAudioProcessPropertyPID), default: pid_t(-1)) }
-                DiagnosticLog.record("discovery.source", "\(state) pids=\(pids)")
+                DiagnosticLog.record("discovery.source", "\(state) pids=\(group.pids)")
             }
         }
         for key in loggedGroups.keys where currentGroups[key] == nil {
             DiagnosticLog.record("discovery.removed", "source=\(key.raw)")
         }
         loggedGroups = currentGroups
-        syncActivityListeners()
         let now = Date()
         liveKeys = Set(groups.filter { !$0.objectIDs.isEmpty }.map(\.id))
         playingKeys = Set(groups.filter(\.isPlaying).map(\.id))

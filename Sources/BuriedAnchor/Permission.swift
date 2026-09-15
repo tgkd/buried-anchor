@@ -11,6 +11,12 @@ enum CapturePermission: Equatable {
 }
 
 enum AudioCapturePermission {
+    private static let probeQueue = DispatchQueue(label: "com.buriedanchor.permission", qos: .userInitiated)
+
+    static func probe(_ completion: @escaping @Sendable (CapturePermission) -> Void) {
+        probeQueue.async { completion(probe()) }
+    }
+
     static func probe() -> CapturePermission {
         let description = CATapDescription(stereoMixdownOfProcesses: [])
         description.uuid = UUID()
