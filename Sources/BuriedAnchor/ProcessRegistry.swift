@@ -15,6 +15,7 @@ struct AudioAppGroup: Identifiable, Equatable, @unchecked Sendable {
     let name: String
     let icon: NSImage?
     let objectIDs: [AudioObjectID]
+    let directObjectIDs: Set<AudioObjectID>
     let pids: [pid_t]
     let isPlaying: Bool
 
@@ -22,6 +23,7 @@ struct AudioAppGroup: Identifiable, Equatable, @unchecked Sendable {
         lhs.id == rhs.id
             && lhs.name == rhs.name
             && lhs.objectIDs == rhs.objectIDs
+            && lhs.directObjectIDs == rhs.directObjectIDs
             && lhs.isPlaying == rhs.isPlaying
     }
 }
@@ -30,6 +32,7 @@ final class ProcessRegistry {
     private struct CachedOwner {
         let key: SourceID
         let started: UInt64
+        let isDirect: Bool
     }
 
     private var ownerCache: [pid_t: CachedOwner] = [:]
@@ -42,11 +45,15 @@ final class ProcessRegistry {
         let processes = currentProcesses()
         objectIDs = Set(processes.map(\.objectID))
         var members: [SourceID: [AudioProcess]] = [:]
+        var direct: [SourceID: Set<AudioObjectID>] = [:]
         var display: [SourceID: (name: String, app: NSRunningApplication?)] = [:]
 
         for process in processes where process.pid != ownPID {
             guard let identity = identify(process) else { continue }
             members[identity.key, default: []].append(process)
+            if identity.isDirect {
+                direct[identity.key, default: []].insert(process.objectID)
+            }
             if display[identity.key] == nil {
                 display[identity.key] = (identity.name, identity.app)
             }
@@ -58,6 +65,7 @@ final class ProcessRegistry {
                 name: display[key]?.name ?? key.fallbackName,
                 icon: display[key]?.app?.icon,
                 objectIDs: procs.map(\.objectID).sorted(),
+                directObjectIDs: direct[key] ?? [],
                 pids: procs.sorted { $0.objectID < $1.objectID }.map(\.pid),
                 isPlaying: procs.contains(where: \.isRunningOutput)
             )
@@ -74,12 +82,13 @@ final class ProcessRegistry {
             .array(propertyAddress(kAudioHardwarePropertyProcessObjectList), of: AudioObjectID.self)
     }
 
-    func owner(of objectID: AudioObjectID) -> SourceID? {
+    func owner(of objectID: AudioObjectID) -> (key: SourceID, isDirect: Bool)? {
         let pid = objectID.value(propertyAddress(kAudioProcessPropertyPID), default: pid_t(-1))
         guard pid > 0, pid != ownPID else { return nil }
-        return identify(
+        guard let identity = identify(
             AudioProcess(objectID: objectID, pid: pid, bundleID: nil, isRunningOutput: true)
-        )?.key
+        ) else { return nil }
+        return (identity.key, identity.isDirect)
     }
 
     private func currentProcesses() -> [AudioProcess] {
@@ -99,35 +108,41 @@ final class ProcessRegistry {
 
     private func identify(
         _ process: AudioProcess
-    ) -> (key: SourceID, name: String, app: NSRunningApplication?)? {
+    ) -> (key: SourceID, name: String, app: NSRunningApplication?, isDirect: Bool)? {
         let started = processInfo(of: process.pid)?.started
 
         if let cached = ownerCache[process.pid], cached.started == started,
            let app = appCache[cached.key] {
-            return (cached.key, app.localizedName ?? cached.key.fallbackName, app)
+            return (cached.key, app.localizedName ?? cached.key.fallbackName, app, cached.isDirect)
         }
         ownerCache.removeValue(forKey: process.pid)
 
         if let app = owningApplication(of: process.pid) {
             let key = app.bundleIdentifier.map(SourceID.bundle)
                 ?? SourceID.ephemeral(app.processIdentifier)
+            let isDirect = app.processIdentifier == process.pid
             if let started {
-                ownerCache[process.pid] = CachedOwner(key: key, started: started)
+                ownerCache[process.pid] = CachedOwner(key: key, started: started, isDirect: isDirect)
             }
             appCache[key] = app
-            return (key, app.localizedName ?? key.fallbackName, app)
+            return (key, app.localizedName ?? key.fallbackName, app, isDirect)
         }
 
         guard process.isRunningOutput else { return nil }
 
         if let executable = executableName(of: process.pid) {
-            return (.executable(executable), URL(fileURLWithPath: executable).lastPathComponent, nil)
+            return (
+                .executable(executable),
+                URL(fileURLWithPath: executable).lastPathComponent,
+                nil,
+                false
+            )
         }
         if let bundleID = process.bundleID {
             let key = SourceID.bundle(bundleID)
-            return (key, key.fallbackName, nil)
+            return (key, key.fallbackName, nil, false)
         }
-        return (.ephemeral(process.pid), "PID \(process.pid)", nil)
+        return (.ephemeral(process.pid), "PID \(process.pid)", nil, false)
     }
 
     private func owningApplication(of pid: pid_t) -> NSRunningApplication? {

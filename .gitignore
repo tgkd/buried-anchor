@@ -2,3 +2,5 @@
 dist/
 local.mk
 .Codex/notes/
+.claude/notes/
+.claude/duck/

@@ -353,11 +353,21 @@ final class MixerModel {
     private func coverNewObjects(_ coverage: DiscoveryCoverage) {
         let now = Date()
         var deferred = false
-        for object in coverage.fresh where firstSeen[object.objectID] == nil && isManaged(object.key) {
+        var promoted = false
+        for object in coverage.fresh where isManaged(object.key) {
+            if object.isDirect {
+                if firstSeen[object.objectID] == .distantPast { continue }
+                DiagnosticLog.record("discovery.fresh", "source=\(object.key.raw) object=\(object.objectID) pid=\(object.pid) settleAfter=0")
+                firstSeen[object.objectID] = .distantPast
+                promoted = true
+                continue
+            }
+            if firstSeen[object.objectID] != nil { continue }
             DiagnosticLog.record("discovery.fresh", "source=\(object.key.raw) object=\(object.objectID) pid=\(object.pid) settleAfter=\(memberSettle)")
             firstSeen[object.objectID] = now
             deferred = true
         }
+        if promoted { scheduleReconcile() }
         if deferred { scheduleSettleRefresh() }
     }
 
@@ -440,7 +450,7 @@ final class MixerModel {
     private func applySnapshot(_ groups: [AudioAppGroup]) {
         var currentGroups: [SourceID: String] = [:]
         for group in groups {
-            let state = "source=\(group.id.raw) members=\(group.objectIDs) playing=\(group.isPlaying)"
+            let state = "source=\(group.id.raw) members=\(group.objectIDs) direct=\(group.directObjectIDs.sorted()) playing=\(group.isPlaying)"
             currentGroups[group.id] = state
             if loggedGroups[group.id] != state {
                 DiagnosticLog.record("discovery.source", "\(state) pids=\(group.pids)")
@@ -464,6 +474,9 @@ final class MixerModel {
             settledObjects = Set(owners.keys)
         }
         objectOwners = owners
+        for group in groups {
+            for objectID in group.directObjectIDs { firstSeen[objectID] = .distantPast }
+        }
         let settledNow = Set(settledMembers(Array(owners.keys), at: now))
         let waking = Set(settledNow.subtracting(settledObjects).compactMap { owners[$0] }.filter(needsRendering))
         settledObjects = settledNow

@@ -79,9 +79,11 @@ shared. Debug logs are not reliably retained; errors include actionable recovery
   process reports an empty device list: treat it as eligible, never as another route.
 - Process restore by bundle ID is disabled because it bypasses live route/ownership validation.
   A fresh process object joins a tap only after it has existed for the member-settle interval in
-  MixerModel. Short-lived helpers (Handy's per-dictation `osascript`) must never touch the graph:
-  a priming aggregate created and destroyed inside a coreaudiod PauseAll/ResumeAll cycle left
-  `ResumeAllContexts` waiting forever and hung every audio client on macOS 27.0.
+  MixerModel, unless it is the owning application's own main process, which joins at once. Both
+  discovery paths must classify it, and a later positive identification promotes an object that was
+  first seen as a helper. Short-lived helpers (Handy's per-dictation `osascript`) must never touch
+  the graph: a priming aggregate created and destroyed inside a coreaudiod PauseAll/ResumeAll cycle
+  left `ResumeAllContexts` waiting forever and hung every audio client on macOS 27.0.
 - Core Audio service restart increments a generation and discards old IDs/listeners. The facade
   rejects queued commands from an old generation; the UI rediscovers sources and reapplies intent.
 - GraphLayout validates the delivered aggregate sample rate and exact input prefix + tap layout;

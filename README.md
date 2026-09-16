@@ -89,6 +89,14 @@ tap is unsuitable for that restriction: macOS 27 discarded its `deviceUID` in li
   destroyed inside a coreaudiod PauseAll/ResumeAll cycle left `ResumeAllContexts` waiting forever
   and hung every audio client until coreaudiod was restarted. The cost is that a brand-new helper
   of a muted or adjusted app can be audible at its own level for up to a second.
+- An app's own main process is exempt from that second and joins immediately. The exemption applies
+  only when the object's pid is the pid of the owning application itself; a child helper, an
+  executable-keyed process and an unidentified one all keep the delay, and a process first seen as
+  one of those is promoted as soon as it is positively identified. This restores the pre-settle
+  timing for main processes. It does not promise a silent first sound: the process object appears
+  only once playback starts, and a `.muted` tap mutes only after the priming IOProc has read it.
+  Nor does it remove the Core Audio teardown race — a main process that exits during priming can
+  still hit it; the exemption only keeps the protection for the helper pattern that caused the hang.
 - Helper processes come and go while an app is controlled. A member whose HAL object no longer
   exists is pruned from the request and the tap, including inside the mute guard; an app with
   no live members waits without a tap. A live process that HAL refuses to capture fails only

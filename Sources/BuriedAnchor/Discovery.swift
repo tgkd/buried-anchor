@@ -5,6 +5,7 @@ struct DiscoveredObject: Sendable {
     let objectID: AudioObjectID
     let key: SourceID
     let pid: pid_t
+    let isDirect: Bool
 }
 
 struct DiscoveryCoverage: Sendable {
@@ -39,9 +40,11 @@ final class DiscoveryWorker: @unchecked Sendable {
         queue.async { [self] in
             let live = registry.objectIDList()
             let fresh = live.filter { !known.contains($0) }.compactMap { objectID -> DiscoveredObject? in
-                guard let key = registry.owner(of: objectID) else { return nil }
+                guard let owner = registry.owner(of: objectID) else { return nil }
                 let pid = objectID.value(propertyAddress(kAudioProcessPropertyPID), default: pid_t(-1))
-                return DiscoveredObject(objectID: objectID, key: key, pid: pid)
+                return DiscoveredObject(
+                    objectID: objectID, key: owner.key, pid: pid, isDirect: owner.isDirect
+                )
             }
             completion(DiscoveryCoverage(live: live, fresh: fresh))
         }
