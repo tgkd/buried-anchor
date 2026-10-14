@@ -2,9 +2,8 @@
 
 Per-app volume mixer (0–150%) for macOS 26+, SwiftPM executable, first-party frameworks only.
 README.md is the user-facing description; this file holds the architecture and support contract.
-The September 2026 implementation replaces the previous main-actor TapEngine; PLAN.md,
-AUDIO_MANAGEMENT_REVIEW.md and AUDIO_SOURCE_ARCHITECTURE_REVIEW.md describe earlier revisions and
-are not certification of the current one.
+The September 2026 implementation replaces the previous main-actor TapEngine; PLAN.md
+describes earlier revisions and is not certification of the current one.
 
 ## How it works
 
