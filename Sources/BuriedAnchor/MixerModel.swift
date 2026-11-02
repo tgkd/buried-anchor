@@ -282,7 +282,9 @@ final class MixerModel {
         engine.updateActivity(playingKeys)
     }
 
-    func setMetering(_ visible: Bool) { isMetering = visible || SelfTest.isRequested }
+    func setPanelVisible(_ visible: Bool) {
+        isMetering = visible || SelfTest.isRequested
+    }
 
     private func installDiscoveryListener() {
         processListListener = nil

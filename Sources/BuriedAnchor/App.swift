@@ -110,8 +110,7 @@ struct MixerPanel: View {
         }
         .padding(12)
         .frame(width: 380)
-        .onAppear { model.setMetering(true) }
-        .onDisappear { model.setMetering(false) }
+        .background(WindowVisibilityReader { model.setPanelVisible($0) })
     }
 
     private var header: some View {
@@ -228,11 +227,7 @@ struct AppRow: View {
                         .help(row.controlState.notice ?? "Volume has not been applied")
                         .accessibilityLabel(row.controlState.notice ?? "Volume has not been applied")
                 }
-                WaveformIndicator(
-                    isPlaying: row.isPlaying,
-                    level: row.level,
-                    isMeasured: row.isActive
-                )
+                PlayingIndicator(isPlaying: row.isPlaying)
                 Spacer(minLength: 0)
             }
             .frame(width: 130, height: rowHeight, alignment: .leading)
@@ -287,39 +282,60 @@ struct AppRow: View {
     }
 }
 
-struct WaveformIndicator: View {
-    let isPlaying: Bool
-    let level: Float
-    let isMeasured: Bool
+struct WindowVisibilityReader: NSViewRepresentable {
+    let onChange: @MainActor (Bool) -> Void
 
-    private let barCount = 5
-    private let barWidth: CGFloat = 2
-    private let minHeight: CGFloat = 3
-    private let maxHeight: CGFloat = 14
-
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 24.0, paused: !isPlaying)) { context in
-            let time = context.date.timeIntervalSinceReferenceDate
-            HStack(alignment: .center, spacing: 2) {
-                ForEach(0..<barCount, id: \.self) { index in
-                    Capsule()
-                        .fill(isPlaying ? Color.accentColor : Color.secondary.opacity(0.35))
-                        .frame(width: barWidth, height: height(index: index, time: time))
-                }
-            }
-        }
-        .frame(width: CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * 2, height: maxHeight)
-        .animation(.easeOut(duration: 0.12), value: isPlaying)
+    func makeNSView(context: Context) -> WindowVisibilityView {
+        let view = WindowVisibilityView()
+        view.onChange = onChange
+        return view
     }
 
-    private func height(index: Int, time: TimeInterval) -> CGFloat {
-        guard isPlaying else { return minHeight }
-        let amplitude = isMeasured
-            ? CGFloat(min(max(level * 1.6, 0.12), 1))
-            : 0.6
-        let phase = time * 7 + Double(index) * 0.85
-        let wave = (sin(phase) + 1) / 2
-        let shaped = 0.3 + 0.7 * wave
-        return minHeight + (maxHeight - minHeight) * amplitude * shaped
+    func updateNSView(_ nsView: WindowVisibilityView, context: Context) {
+        nsView.onChange = onChange
+    }
+}
+
+final class WindowVisibilityView: NSView {
+    var onChange: (@MainActor (Bool) -> Void)?
+    private var observer: NSObjectProtocol?
+    private var lastReported: Bool?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let observer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        observer = nil
+        if let window {
+            observer = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.report() }
+            }
+        }
+        report()
+    }
+
+    private func report() {
+        let visible = window?.occlusionState.contains(.visible) ?? false
+        guard visible != lastReported else {
+            return
+        }
+        lastReported = visible
+        onChange?(visible)
+    }
+}
+
+struct PlayingIndicator: View {
+    let isPlaying: Bool
+
+    var body: some View {
+        Image(systemName: "waveform")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(isPlaying ? Color.accentColor : Color.secondary.opacity(0.35))
+            .frame(width: 18, height: 14)
+            .help(isPlaying ? "Playing now" : "Not playing")
+            .accessibilityLabel(isPlaying ? "Playing now" : "Not playing")
     }
 }

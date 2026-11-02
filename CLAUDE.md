@@ -173,7 +173,9 @@ tail -F ~/Library/Logs/BuriedAnchor/events.jsonl | jq -r '[.time, .event, .detai
   a coincidental channel-count match or fall back to an unverified tap order.
 - Renderer is preallocated and lock-free at the application level. Atomic targets/meters are its
   only cross-thread mutable controls. Reject changed callback buffer shapes before any mixing.
-  SwiftUI receives snapshots and updates displayed meters only when visible.
+  SwiftUI receives snapshots. The model refreshes meter levels only while the panel window is
+  visible, judged by window occlusion because the MenuBarExtra window persists while hidden. Rows
+  show a static playing indicator: any per-frame animation re-lays out the whole panel.
 - Device-scoped samples already have physical channel ordering. Do not remap a preferred pair
   twice. The general renderer supports normalized mono fold and explicit destination channels;
   the live backend deliberately supports only the narrower verified mono/stereo topology.
