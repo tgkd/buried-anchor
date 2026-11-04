@@ -21,15 +21,19 @@ controlled.
 
 ## Use
 
-Click the menu-bar icon. Every app that is playing, or recently played, gets a row with a slider.
+Click the menu-bar icon. Every app that is playing or played in the last few minutes gets a row
+with a slider, and so does a running app with a saved volume. Apps that are not running are
+hidden; their saved volume applies again when they play.
 
 - Drag the slider to set the app's volume. Double-click it to return to 100%.
 - The mute button mutes the app and later restores its previous volume.
-- Right-click a row and choose Reset to forget the app's saved setting.
+- Click × on a row that is not playing, or right-click a row and choose Reset, to forget the app's
+  saved setting and remove the row.
 - A warning icon means the app is waiting for audio, plays through an unsupported output, or could
   not be controlled.
 
-Settings are remembered per app. Settings also offers launch at login and optional soft saturation
+Settings are remembered per app. iOS Simulator apps are remembered by bundle ID, so a setting
+survives reinstalling the app. Settings also offers launch at login and optional soft saturation
 for the controlled mix.
 
 ## Limitations

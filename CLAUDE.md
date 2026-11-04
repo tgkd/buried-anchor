@@ -182,9 +182,14 @@ tail -F ~/Library/Logs/BuriedAnchor/events.jsonl | jq -r '[.time, .event, .detai
 - Soft saturation is optional coloration, not a transparent global limiter; without it the
   controlled mix hard-clips at full scale. Neither limits unmanaged apps mixed downstream.
 - Durable fallback executable keys contain full paths. Do not reapply old truncated executable-name
-  settings to guessed paths. Bundle keys retain their existing persistence format.
+  settings to guessed paths. Bundle keys retain their existing persistence format. iOS Simulator
+  app processes key by the bundle ID in their .app's Info.plist, because the container path
+  changes with every install. Saved executable keys whose file is gone are dropped at load,
+  except under /Volumes, where an unmounted disk would look the same.
 - UI percentages are requested values. Pending/unsupported/failed control must remain visible;
-  reset is available even when no tap exists, and meters clear when rendering stops.
+  reset is available even when no tap exists, and meters clear when rendering stops. A source
+  with no live process is listed only while it lingers after playback or the engine still
+  holds its saved intent, and it shows no control warning. Reset removes a non-playing row.
 
 ## Known limitations
 

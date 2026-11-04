@@ -131,6 +131,9 @@ final class ProcessRegistry {
         guard process.isRunningOutput else { return nil }
 
         if let executable = executableName(of: process.pid) {
+            if let simulated = simulatorApp(containing: executable) {
+                return (.bundle(simulated.bundleID), simulated.name, nil, false)
+            }
             return (
                 .executable(executable),
                 URL(fileURLWithPath: executable).lastPathComponent,
@@ -177,6 +180,27 @@ final class ProcessRegistry {
         let birth = info.kp_proc.p_starttime
         let started = UInt64(bitPattern: Int64(birth.tv_sec) &* 1_000_000 &+ Int64(birth.tv_usec))
         return (parent > 0 ? parent : nil, (name?.isEmpty ?? true) ? nil : name, started)
+    }
+
+    private func simulatorApp(containing executable: String) -> (bundleID: String, name: String)? {
+        let container = "/data/Containers/Bundle/Application/"
+        guard executable.contains("/Library/Developer/CoreSimulator/"),
+              let range = executable.range(of: container)
+        else { return nil }
+        let rest = executable[range.upperBound...].split(separator: "/", maxSplits: 2)
+        guard rest.count >= 2, rest[1].hasSuffix(".app") else { return nil }
+        let appPath = "\(executable[..<range.upperBound])\(rest[0])/\(rest[1])"
+        guard let bundle = Bundle(path: appPath),
+              let bundleID = bundle.bundleIdentifier, !bundleID.isEmpty
+        else { return nil }
+        let name = [
+            bundle.object(forInfoDictionaryKey: "CFBundleDisplayName"),
+            bundle.object(forInfoDictionaryKey: "CFBundleName")
+        ]
+            .compactMap { $0 as? String }
+            .first { !$0.isEmpty }
+            ?? URL(fileURLWithPath: appPath).deletingPathExtension().lastPathComponent
+        return (bundleID, name)
     }
 
     private func executableName(of pid: pid_t) -> String? {

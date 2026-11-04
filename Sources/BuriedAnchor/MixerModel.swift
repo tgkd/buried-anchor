@@ -177,7 +177,9 @@ final class MixerModel {
         persist(premute, forKey: Self.premuteKey)
         engine.release(id)
         lastLive.removeValue(forKey: id)
+        lastPlaying.removeValue(forKey: id)
         engineError = engine.lastError
+        rows.removeAll { $0.id == id && !$0.isPlaying }
         if let index = rows.firstIndex(where: { $0.id == id }) {
             rows[index].percent = 100
             rows[index].isControlled = false
@@ -234,6 +236,8 @@ final class MixerModel {
             let id = SourceID(raw: raw)
             guard id.isDurable else { continue }
             if case .executable(let path) = id, !path.hasPrefix("/") { continue }
+            if case .executable(let path) = id, !path.hasPrefix("/Volumes/"),
+               !FileManager.default.fileExists(atPath: path) { continue }
             result[id] = min(max(value, 0), 150).rounded()
         }
         return result
@@ -297,7 +301,14 @@ final class MixerModel {
         }
     }
 
-    private func controlState(for key: SourceID, percent: Double) -> SourceControlState {
+    private func isHeld(_ key: SourceID) -> Bool {
+        engine.isControlled(key) && percents[key] != nil
+    }
+
+    private func controlState(for row: Row) -> SourceControlState {
+        if row.objectIDs.isEmpty { return .bypassed }
+        let key = row.id
+        let percent = row.percent
         if percent != 100 && !permission.isGranted {
             return .failed("System audio permission is required to apply this volume")
         }
@@ -322,7 +333,7 @@ final class MixerModel {
             let key = rows[index].id
             let controlled = engine.isControlled(key)
             let active = engine.isActive(key)
-            let state = controlState(for: key, percent: rows[index].percent)
+            let state = controlState(for: rows[index])
             if rows[index].isControlled != controlled { rows[index].isControlled = controlled }
             if rows[index].isActive != active { rows[index].isActive = active }
             if !active && rows[index].level != 0 { rows[index].level = 0 }
@@ -504,7 +515,7 @@ final class MixerModel {
         for group in groups {
             let saved = percents[group.id] ?? 100
             let recent = lastPlaying[group.id].map { now.timeIntervalSince($0) < lingerInterval } ?? false
-            guard group.isPlaying || recent || engine.isControlled(group.id) || saved != 100
+            guard group.isPlaying || recent || isHeld(group.id) || saved != 100
             else { continue }
             next.append(
                 Row(
@@ -526,7 +537,7 @@ final class MixerModel {
         }
 
         let known = Set(next.map(\.id))
-        let absent = Set(engine.controlledKeys).union(percents.filter { $0.value != 100 }.keys).union(
+        let absent = Set(engine.controlledKeys.filter(isHeld)).union(
             lastPlaying.filter { now.timeIntervalSince($0.value) < lingerInterval }.keys
         ).subtracting(known)
         for key in absent {
@@ -555,7 +566,7 @@ final class MixerModel {
             liveKeys.contains($0.key) || lastPlaying[$0.key] != nil
                 || percents[$0.key] != nil || engine.isControlled($0.key)
         }
-        for index in next.indices { next[index].controlState = controlState(for: next[index].id, percent: next[index].percent) }
+        for index in next.indices { next[index].controlState = controlState(for: next[index]) }
         rows = next
         sweepRetention(now)
         engineError = engine.lastError

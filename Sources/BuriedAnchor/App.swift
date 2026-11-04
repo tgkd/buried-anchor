@@ -258,6 +258,22 @@ struct AppRow: View {
                 .font(.caption.monospacedDigit())
                 .frame(width: 38, height: rowHeight, alignment: .trailing)
                 .foregroundStyle(row.percent > 100 ? .orange : .primary)
+
+            Button {
+                model.reset(row.id)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+                    .frame(width: 14, height: rowHeight)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("Reset to 100% and remove from the list")
+            .accessibilityLabel("Remove \(row.name)")
+            .opacity(row.isPlaying ? 0 : 1)
+            .disabled(row.isPlaying)
+            .accessibilityHidden(row.isPlaying)
         }
         .frame(height: rowHeight)
         .contentShape(Rectangle())
